@@ -1,0 +1,135 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Enable Remote Desktop & Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+      - name: 2. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString "Nexouya2026RdpX7" -AsPlainText -Force
+          New-LocalUser -Name "NexAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "NexAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Nexouya2026RdpX7
+
+      - name: 3. Install & Connect Tailscale VPN
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          # Download and install Tailscale silently
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          
+          # Connect to Tailscale network
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          
+          Start-Sleep -Seconds 8
+          
+          # Get Tailscale IP
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : NexAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Nexouya2026RdpX7" -ForegroundColor Yellow
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+      - name: 4. Install Android Emulators
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          # name = chocolatey package
+          $packages = [ordered]@{
+            "LDPlayer"        = "ldplayer"
+            "BlueStacks"      = "bluestacks"
+            "NoxPlayer"       = "nox"
+            "MEmu"            = "memu"
+            "Android Studio"  = "androidstudio"
+          }
+
+          foreach ($name in $packages.Keys) {
+            Write-Host ">>> Installing $name ..." -ForegroundColor Cyan
+            try {
+              choco install $packages[$name] -y --no-progress --ignore-checksums
+            } catch {
+              Write-Host "!!! $name failed: $_" -ForegroundColor Red
+            }
+          }
+
+          # MuMu Player (not on Chocolatey) - direct download, silent install
+          # NOTE: update the URL if NetEase changes it
+          try {
+            Write-Host ">>> Installing MuMu Player ..." -ForegroundColor Cyan
+            $mumu = "C:\mumu-setup.exe"
+            Invoke-WebRequest "https://mumu.163.com/global/download/en/MuMuInstaller_x64_global.exe" -OutFile $mumu -UseBasicParsing
+            Start-Process $mumu -ArgumentList "/S" -Wait
+          } catch {
+            Write-Host "!!! MuMu failed: $_" -ForegroundColor Red
+          }
+
+      - name: 5. Create Desktop Shortcuts
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $desktop = "C:\Users\Public\Desktop"   # visible to every user (NexAdmin, runneradmin)
+          $shell   = New-Object -ComObject WScript.Shell
+
+          # shortcut name = exe file name(s) to look for
+          $apps = [ordered]@{
+            "LDPlayer"                  = @("dnplayer.exe")
+            "BlueStacks"                = @("HD-Player.exe")
+            "NoxPlayer"                 = @("Nox.exe")
+            "MEmu"                      = @("MEmu.exe")
+            "MuMu Player"               = @("MuMuPlayer.exe", "MuMuNxMain.exe")
+            "Android Studio"            = @("studio64.exe")
+          }
+
+          $roots = @("C:\LDPlayer", "C:\Program Files", "C:\Program Files (x86)",
+                     "$env:ProgramData", "C:\Android", "C:\Users\Public")
+
+          foreach ($name in $apps.Keys) {
+            $exe = $null
+            foreach ($root in $roots) {
+              if (-not (Test-Path $root)) { continue }
+              foreach ($file in $apps[$name]) {
+                $found = Get-ChildItem -Path $root -Filter $file -Recurse -ErrorAction SilentlyContinue |
+                         Select-Object -First 1
+                if ($found) { $exe = $found.FullName; break }
+              }
+              if ($exe) { break }
+            }
+
+            if ($exe) {
+              $lnk = $shell.CreateShortcut("$desktop\$name.lnk")
+              $lnk.TargetPath       = $exe
+              $lnk.WorkingDirectory = Split-Path $exe
+              $lnk.IconLocation     = $exe
+              $lnk.Save()
+              Write-Host "OK  $name -> $exe" -ForegroundColor Green
+            } else {
+              Write-Host "MISSING  $name (not installed)" -ForegroundColor Yellow
+            }
+          }
+
+      - name: 6. Keep Server Alive
+        run: |
+          for ($i = 1; $i -le 330; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/330] Server running..."
+          }

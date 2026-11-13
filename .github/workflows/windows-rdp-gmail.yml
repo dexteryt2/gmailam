@@ -90,11 +90,17 @@ jobs:
               if ($cfg -match $pattern) {
                 $cfg = $cfg -replace $pattern, $replacements[$pattern]
               } else {
-                $cfg += "`r`n$($replacements[$pattern])"
+                if ($cfg -match '\[PropertySettings\]') {
+                  $cfg = $cfg -replace '(\[PropertySettings\])', "`$1`r`n$($replacements[$pattern])"
+                } else {
+                  $cfg += "`r`n$($replacements[$pattern])"
+                }
               }
             }
             $cfg | Set-Content $vmCfg -Encoding UTF8
             Write-Host "leidianConfig.ini patched."
+          } else {
+            Write-Host "leidianConfig.ini not found, ADB script will handle it."
           }
           $ldRoot | Set-Content "C:\ldroot.txt" -Encoding UTF8
 
@@ -116,10 +122,13 @@ jobs:
             'echo   SAMSUNG GALAXY S23 FE  -  Starting...',
             'echo  ============================================',
             'echo.',
+            'echo  Step 1: Launching LDPlayer...',
             "start `"`" `"$ldRoot\dnplayer.exe`"",
             'echo.',
-            'echo  Wait for Android home screen (1-3 min)',
-            'echo  Then run: 2 - SETUP SPOOF.bat',
+            'echo  WAIT for the Android home screen to appear',
+            'echo  (usually 1-3 minutes).',
+            'echo.',
+            'echo  Then double-click: SETUP SPOOF.bat',
             'echo.',
             'pause'
           )
@@ -129,8 +138,13 @@ jobs:
             '@echo off',
             'title SETUP SPOOF - Samsung S23 FE Identity',
             'color 0E',
+            'echo.',
+            'echo  =============================================',
+            'echo   SETUP: Samsung S23 FE Spoof + TextNow',
+            'echo  =============================================',
+            'echo.',
             "set ADB=`"$adbPath`"",
-            'echo [1/7] Connecting ADB...',
+            'echo [1/7] Connecting ADB to LDPlayer...',
             '%ADB% connect 127.0.0.1:5555',
             'timeout /t 3 /nobreak >nul',
             'echo [2/7] Getting root...',
@@ -138,10 +152,10 @@ jobs:
             'timeout /t 3 /nobreak >nul',
             '%ADB% connect 127.0.0.1:5555',
             'timeout /t 2 /nobreak >nul',
-            'echo [3/7] Remounting /system...',
+            'echo [3/7] Remounting /system as read-write...',
             '%ADB% shell mount -o rw,remount /system',
             'timeout /t 2 /nobreak >nul',
-            'echo [4/7] Injecting Samsung S23 FE identity...',
+            'echo [4/7] Injecting Samsung S23 FE identity into build.prop...',
             '%ADB% shell "sed -i ''s/ro.product.manufacturer=.*/ro.product.manufacturer=samsung/'' /system/build.prop"',
             '%ADB% shell "sed -i ''s/ro.product.brand=.*/ro.product.brand=samsung/'' /system/build.prop"',
             '%ADB% shell "sed -i ''s/ro.product.model=.*/ro.product.model=SM-S711B/'' /system/build.prop"',
@@ -151,41 +165,69 @@ jobs:
             '%ADB% shell "sed -i ''s/ro.build.type=.*/ro.build.type=user/'' /system/build.prop"',
             '%ADB% shell "sed -i ''s/ro.build.tags=.*/ro.build.tags=release-keys/'' /system/build.prop"',
             '%ADB% shell "sed -i ''s/ro.build.version.release=.*/ro.build.version.release=14/'' /system/build.prop"',
-            'echo [5/7] Clearing GMS cache...',
+            '%ADB% shell "sed -i ''s/ro.build.version.security_patch=.*/ro.build.version.security_patch=2024-05-01/'' /system/build.prop"',
+            '%ADB% shell "grep -q ''ro.product.manufacturer'' /system/build.prop || echo ro.product.manufacturer=samsung >> /system/build.prop"',
+            'echo [5/7] Clearing Google Play Services cache...',
             '%ADB% shell pm clear com.google.android.gms',
             '%ADB% shell pm clear com.android.vending',
             'timeout /t 2 /nobreak >nul',
             'echo [6/7] Downloading TextNow APK...',
             'powershell -Command "Invoke-WebRequest ''https://d.apkpure.net/b/APK/com.enflick.android.TextNow?nc=arm64-v8a&sr=high'' -OutFile ''C:\textnow.apk'' -UseBasicParsing -TimeoutSec 60"',
-            'if exist C:\textnow.apk (%ADB% install -r C:\textnow.apk) else (echo TextNow download failed.)',
-            'echo [7/7] Rebooting emulator...',
+            'if exist C:\textnow.apk (%ADB% install -r C:\textnow.apk) else (echo TextNow download failed. Install manually.)',
+            'echo [7/7] Rebooting emulator to apply identity...',
             '%ADB% reboot',
             'echo.',
-            'echo  DONE! After reboot: open TextNow, get US number, add Google account.',
+            'echo  =============================================',
+            'echo   DONE! After reboot:',
+            'echo   1. Open TextNow, create account, get US number',
+            'echo   2. Settings > Accounts > Add Account > Google',
+            'echo   3. Use TextNow number when asked for SMS',
+            'echo  =============================================',
+            'echo.',
             'pause'
           )
           $setupLines | Set-Content "$desk\2 - SETUP SPOOF.bat" -Encoding ASCII
 
           $guideLines = @(
-            'Samsung S23 FE Virtual Phone - Gmail Creator',
+            'SAMSUNG S23 FE VIRTUAL PHONE - GMAIL CREATOR',
+            'راهنمای ساخت جیمیل بدون ارور',
             '',
-            'STEP 1: Double-click "1 - START SAMSUNG PHONE.bat"',
-            '        Wait for LDPlayer to boot (1-3 min)',
+            'Google 3 چیز چک میکنه:',
+            '  1. دستگاه واقعی یا emulator؟  -> با spoof حل شد',
+            '  2. SIM کارت داری؟             -> با TextNow حل میشه',
+            '  3. ربات هستی؟                 -> تو خودت کلیک میکنی',
             '',
-            'STEP 2: Double-click "2 - SETUP SPOOF.bat"',
-            '        Emulator will reboot automatically',
+            'STEP 1: روی "1 - START SAMSUNG PHONE.bat" دابل کلیک کن',
+            '        صبر کن LDPlayer بیاد بالا (1-3 دقیقه)',
             '',
-            'STEP 3: Inside LDPlayer after reboot:',
-            '        Open TextNow, create account, get US number',
+            'STEP 2: بعد از اینکه صفحه اندروید اومد،',
+            '        روی "2 - SETUP SPOOF.bat" دابل کلیک کن',
+            '        emulator ری استارت میشه خودکار',
+            '',
+            'STEP 3: داخل LDPlayer بعد از ری استارت:',
+            '        اپ TextNow رو باز کن',
+            '        اکانت بساز، شماره رایگان آمریکایی بگیر',
             '',
             'STEP 4: Settings > Accounts > Add Account > Google',
-            '        Use TextNow number, SMS code appears in TextNow app',
+            '        (از Settings گوشی، نه از مرورگر!)',
+            '        وقتی شماره خواست: شماره TextNow بده',
+            '        کد SMS توی اپ TextNow میاد',
             '',
-            'Device: Samsung SM-S711B (Galaxy S23 FE) / Android 14'
+            'نکات مهم:',
+            '  * اگه ارور داد، SETUP SPOOF رو دوباره اجرا کن',
+            '  * هر بار که LDPlayer رو میبندی نیاز به SETUP نیست',
+            '',
+            'Device Identity:',
+            '  Brand  : Samsung',
+            '  Model  : SM-S711B (Galaxy S23 FE)',
+            '  Android: 14'
           )
           $guideLines | Set-Content "$desk\3 - GUIDE (READ THIS FIRST).txt" -Encoding UTF8
 
-          Write-Host "Desktop toolkit created successfully."
+          Write-Host "Desktop toolkit created."
+          Write-Host "  1 - START SAMSUNG PHONE.bat"
+          Write-Host "  2 - SETUP SPOOF.bat"
+          Write-Host "  3 - GUIDE (READ THIS FIRST).txt"
 
       - name: 7. Keep Server Alive (6 Hours)
         shell: pwsh

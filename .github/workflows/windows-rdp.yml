@@ -26,19 +26,12 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
           Start-Sleep -Seconds 5
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
           Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
           $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
@@ -53,79 +46,200 @@ jobs:
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
-
-          # name = chocolatey package
           $packages = [ordered]@{
-            "LDPlayer"        = "ldplayer"
-            "BlueStacks"      = "bluestacks"
-            "NoxPlayer"       = "nox"
-            "MEmu"            = "memu"
-            "Android Studio"  = "androidstudio"
+            "LDPlayer"       = "ldplayer"
+            "BlueStacks"     = "bluestacks"
+            "NoxPlayer"      = "nox"
+            "MEmu"           = "memu"
+            "Android Studio" = "androidstudio"
           }
-
           foreach ($name in $packages.Keys) {
             Write-Host ">>> Installing $name ..." -ForegroundColor Cyan
-            try {
-              choco install $packages[$name] -y --no-progress --ignore-checksums
-            } catch {
-              Write-Host "!!! $name failed: $_" -ForegroundColor Red
-            }
+            try { choco install $packages[$name] -y --no-progress --ignore-checksums }
+            catch { Write-Host "!!! $name failed: $_" -ForegroundColor Red }
           }
-
-          # MuMu Player (not on Chocolatey) - direct download, silent install
-          # NOTE: update the URL if NetEase changes it
           try {
             Write-Host ">>> Installing MuMu Player ..." -ForegroundColor Cyan
             $mumu = "C:\mumu-setup.exe"
             Invoke-WebRequest "https://mumu.163.com/global/download/en/MuMuInstaller_x64_global.exe" -OutFile $mumu -UseBasicParsing
             Start-Process $mumu -ArgumentList "/S" -Wait
-          } catch {
-            Write-Host "!!! MuMu failed: $_" -ForegroundColor Red
-          }
+          } catch { Write-Host "!!! MuMu failed: $_" -ForegroundColor Red }
 
-      - name: 5. Create Desktop Shortcuts
+      - name: 5. Create Desktop Shortcuts (Emulators)
         shell: pwsh
         continue-on-error: true
         run: |
-          $desktop = "C:\Users\Public\Desktop"   # visible to every user (NexAdmin, runneradmin)
+          $desktop = "C:\Users\Public\Desktop"
           $shell   = New-Object -ComObject WScript.Shell
-
-          # shortcut name = exe file name(s) to look for
           $apps = [ordered]@{
-            "LDPlayer"                  = @("dnplayer.exe")
-            "BlueStacks"                = @("HD-Player.exe")
-            "NoxPlayer"                 = @("Nox.exe")
-            "MEmu"                      = @("MEmu.exe")
-            "MuMu Player"               = @("MuMuPlayer.exe", "MuMuNxMain.exe")
-            "Android Studio"            = @("studio64.exe")
+            "LDPlayer"       = @("dnplayer.exe")
+            "BlueStacks"     = @("HD-Player.exe")
+            "NoxPlayer"      = @("Nox.exe")
+            "MEmu"           = @("MEmu.exe")
+            "MuMu Player"    = @("MuMuPlayer.exe", "MuMuNxMain.exe")
+            "Android Studio" = @("studio64.exe")
           }
-
-          $roots = @("C:\LDPlayer", "C:\Program Files", "C:\Program Files (x86)",
-                     "$env:ProgramData", "C:\Android", "C:\Users\Public")
-
+          $roots = @("C:\LDPlayer","C:\Program Files","C:\Program Files (x86)","$env:ProgramData","C:\Android","C:\Users\Public")
           foreach ($name in $apps.Keys) {
             $exe = $null
             foreach ($root in $roots) {
               if (-not (Test-Path $root)) { continue }
               foreach ($file in $apps[$name]) {
-                $found = Get-ChildItem -Path $root -Filter $file -Recurse -ErrorAction SilentlyContinue |
-                         Select-Object -First 1
+                $found = Get-ChildItem -Path $root -Filter $file -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($found) { $exe = $found.FullName; break }
               }
               if ($exe) { break }
             }
-
             if ($exe) {
               $lnk = $shell.CreateShortcut("$desktop\$name.lnk")
-              $lnk.TargetPath       = $exe
-              $lnk.WorkingDirectory = Split-Path $exe
-              $lnk.IconLocation     = $exe
-              $lnk.Save()
+              $lnk.TargetPath = $exe; $lnk.WorkingDirectory = Split-Path $exe; $lnk.IconLocation = $exe; $lnk.Save()
               Write-Host "OK  $name -> $exe" -ForegroundColor Green
-            } else {
-              Write-Host "MISSING  $name (not installed)" -ForegroundColor Yellow
-            }
+            } else { Write-Host "MISSING  $name" -ForegroundColor Yellow }
           }
+
+      - name: 5b. Build Samsung Galaxy S23 FE Virtual Phone
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # ── 1. SDK setup ──────────────────────────────────────────────────
+          $sdk = "C:\Android\sdk"
+          New-Item -ItemType Directory -Force "$sdk\cmdline-tools" | Out-Null
+          Invoke-WebRequest "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip" `
+            -OutFile C:\cmdtools.zip -UseBasicParsing
+          Expand-Archive C:\cmdtools.zip -DestinationPath "$sdk\cmdline-tools\tmp" -Force
+          Move-Item "$sdk\cmdline-tools\tmp\cmdline-tools" "$sdk\cmdline-tools\latest" -Force
+
+          $env:ANDROID_SDK_ROOT = $sdk
+          $sm  = "$sdk\cmdline-tools\latest\bin\sdkmanager.bat"
+          $avd = "$sdk\cmdline-tools\latest\bin\avdmanager.bat"
+
+          # Accept all licenses
+          "y`n" * 20 | & $sm --licenses | Out-Null
+
+          # Install system image: Android 14, Play Store, x86_64
+          & $sm "platform-tools" "emulator" "system-images;android-34;google_apis_playstore;x86_64"
+
+          # ── 2. Create AVD ─────────────────────────────────────────────────
+          # Use Pixel 6a as base hardware (closest AOSP profile to S23 FE size)
+          "no" | & $avd create avd `
+            -n "Galaxy_S23_FE" `
+            -k "system-images;android-34;google_apis_playstore;x86_64" `
+            -d "pixel_6a" `
+            --force
+
+          # ── 3. Patch config.ini — Samsung hardware identity ───────────────
+          # Find the AVD folder (created under the runner's profile)
+          $avdDir = Get-ChildItem -Path "C:\Users\runneradmin\.android\avd" `
+                      -Filter "Galaxy_S23_FE.avd" -Directory -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $avdDir) {
+            # fallback: search all user profiles
+            $avdDir = Get-ChildItem -Path "C:\Users" -Recurse `
+                        -Filter "Galaxy_S23_FE.avd" -Directory -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          }
+
+          if ($avdDir) {
+            $cfg = "$($avdDir.FullName)\config.ini"
+            Write-Host "Patching: $cfg" -ForegroundColor Cyan
+
+            # Read existing config
+            $lines = Get-Content $cfg
+
+            # Remove any existing hw.device lines we'll override
+            $lines = $lines | Where-Object {
+              $_ -notmatch "^hw\.device\." -and
+              $_ -notmatch "^tag\.display" -and
+              $_ -notmatch "^AvdId" -and
+              $_ -notmatch "^avd\.ini\.displayname"
+            }
+
+            # Append Samsung S23 FE identity block
+            $lines += @(
+              "",
+              "# ── Samsung Galaxy S23 FE identity ──",
+              "AvdId=Galaxy_S23_FE",
+              "avd.ini.displayname=Samsung Galaxy S23 FE",
+              "hw.device.manufacturer=Samsung",
+              "hw.device.name=Samsung Galaxy S23 FE",
+              "tag.display=Google Play",
+              "# RAM and storage matching S23 FE",
+              "hw.ramSize=8192",
+              "disk.dataPartition.size=256G",
+              "hw.lcd.width=1080",
+              "hw.lcd.height=2340",
+              "hw.lcd.density=440",
+              "hw.cpu.ncore=8"
+            )
+
+            $lines | Set-Content $cfg -Encoding UTF8
+            Write-Host "config.ini patched OK" -ForegroundColor Green
+          } else {
+            Write-Host "WARNING: AVD folder not found, skipping config patch" -ForegroundColor Yellow
+          }
+
+          # ── 4. Build the launch script with full S23 FE prop spoofing ─────
+          # The -prop flag injects ro.* properties at emulator boot — before Android reads them.
+          # This is the ONLY way to spoof read-only build props without root on a Play Store image.
+          $launchScript = @"
+@echo off
+title Samsung Galaxy S23 FE - Virtual Phone
+echo.
+echo  =========================================
+echo   Samsung Galaxy S23 FE - Booting...
+echo   First boot: Setup Wizard will appear.
+echo   Follow: Language > WiFi > Google Account
+echo  =========================================
+echo.
+"C:\Android\sdk\emulator\emulator.exe" ^
+  -avd Galaxy_S23_FE ^
+  -no-accel ^
+  -gpu swiftshader_indirect ^
+  -no-snapshot ^
+  -wipe-data ^
+  -prop ro.product.manufacturer=Samsung ^
+  -prop ro.product.brand=samsung ^
+  -prop ro.product.vendor.manufacturer=Samsung ^
+  -prop ro.product.vendor.brand=samsung ^
+  -prop ro.product.model=SM-S711B ^
+  -prop ro.product.device=s5e9925 ^
+  -prop ro.product.name=SM-S711B ^
+  -prop ro.product.marketname="Galaxy S23 FE" ^
+  -prop ro.build.product=s5e9925 ^
+  -prop ro.build.flavor=SM-S711B-user ^
+  -prop ro.build.type=user ^
+  -prop ro.build.tags=release-keys ^
+  -prop ro.build.fingerprint="samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys" ^
+  -prop ro.bootimage.build.fingerprint="samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys" ^
+  -prop ro.vendor.build.fingerprint="samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys" ^
+  -prop ro.build.version.release=14 ^
+  -prop ro.build.version.sdk=34 ^
+  -prop ro.build.version.security_patch=2024-05-01 ^
+  -prop ro.hardware=s5e9925 ^
+  -prop ro.board.platform=s5e9925 ^
+  -prop ro.boot.hardware=s5e9925 ^
+  -prop gsm.operator.alpha=Samsung ^
+  -prop persist.sys.timezone=Asia/Tehran
+"@
+          $launchScript | Set-Content "C:\Users\Public\Desktop\Samsung Galaxy S23 FE.bat" -Encoding ASCII
+          Write-Host "Launch script written to Desktop." -ForegroundColor Green
+
+          # ── 5. Desktop shortcut pointing at the .bat ──────────────────────
+          $sh  = New-Object -ComObject WScript.Shell
+          $lnk = $sh.CreateShortcut("C:\Users\Public\Desktop\Samsung Galaxy S23 FE.lnk")
+          $lnk.TargetPath       = "C:\Users\Public\Desktop\Samsung Galaxy S23 FE.bat"
+          $lnk.WorkingDirectory = "C:\Android\sdk\emulator"
+          $lnk.IconLocation     = "C:\Android\sdk\emulator\emulator.exe"
+          $lnk.Save()
+          Write-Host "Desktop shortcut created." -ForegroundColor Green
+
+          Write-Host ""
+          Write-Host "======================================================" -ForegroundColor Magenta
+          Write-Host "  Samsung Galaxy S23 FE Virtual Phone is READY" -ForegroundColor Cyan
+          Write-Host "  Double-click the shortcut on the desktop to start." -ForegroundColor Yellow
+          Write-Host "  First boot = Setup Wizard (language / Google / etc.)" -ForegroundColor Yellow
+          Write-Host "  Device will identify as: SM-S711B (Galaxy S23 FE)" -ForegroundColor Green
+          Write-Host "======================================================" -ForegroundColor Magenta
 
       - name: 6. Keep Server Alive
         run: |

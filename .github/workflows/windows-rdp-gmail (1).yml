@@ -1,0 +1,279 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # ══════════════════════════════════════════════
+      #  1. Enable RDP
+      # ══════════════════════════════════════════════
+      - name: 1. Enable Remote Desktop & Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+      # ══════════════════════════════════════════════
+      #  2. Admin account
+      # ══════════════════════════════════════════════
+      - name: 2. Create Admin Account
+        shell: pwsh
+        run: |
+          $Password = ConvertTo-SecureString "Nexouya2026RdpX7" -AsPlainText -Force
+          New-LocalUser -Name "NexAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "NexAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Nexouya2026RdpX7
+
+      # ══════════════════════════════════════════════
+      #  3. Tailscale
+      # ══════════════════════════════════════════════
+      - name: 3. Install & Connect Tailscale VPN
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          Start-Sleep -Seconds 8
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : NexAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Nexouya2026RdpX7" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
+
+      # ══════════════════════════════════════════════
+      #  4. Install LDPlayer 9
+      # ══════════════════════════════════════════════
+      - name: 4. Install LDPlayer 9
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host ">>> Downloading LDPlayer 9..." -ForegroundColor Cyan
+          $ldUrl = "https://encdn.ldmnq.com/download/package/LDPlayer9_en_installer.exe"
+          $ldInst = "C:\ld9-setup.exe"
+          try {
+            Invoke-WebRequest $ldUrl -OutFile $ldInst -UseBasicParsing -TimeoutSec 120
+            Write-Host ">>> Installing LDPlayer 9 silently..." -ForegroundColor Cyan
+            Start-Process $ldInst -ArgumentList "--silent" -Wait
+            Write-Host "LDPlayer 9 installed." -ForegroundColor Green
+          } catch {
+            Write-Host "LDPlayer direct download failed: $_ - trying chocolatey..." -ForegroundColor Yellow
+            choco install ldplayer -y --no-progress --ignore-checksums
+          }
+
+      # ══════════════════════════════════════════════
+      #  5. Pre-configure LDPlayer: Samsung S23 FE
+      # ══════════════════════════════════════════════
+      - name: 5. Pre-configure LDPlayer as Samsung Galaxy S23 FE
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ldRoot = $null
+          $candidates = @(
+            "C:\LDPlayer",
+            "C:\Program Files\LDPlayer",
+            "C:\Program Files (x86)\LDPlayer",
+            "$env:LOCALAPPDATA\LDPlayer"
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path "$c\ldconsole.exe") { $ldRoot = $c; break }
+          }
+          if (-not $ldRoot) {
+            $found = Get-ChildItem "C:\" -Filter "ldconsole.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($found) { $ldRoot = $found.DirectoryName }
+          }
+          if (-not $ldRoot) {
+            Write-Host "LDPlayer root not found. Skipping config." -ForegroundColor Yellow
+            exit 0
+          }
+          Write-Host "LDPlayer found at: $ldRoot" -ForegroundColor Green
+          $vmCfg = "$ldRoot\vms\leidian0\config\leidianConfig.ini"
+          if (Test-Path $vmCfg) {
+            $cfg = Get-Content $vmCfg -Raw
+            $replacements = @{
+              'FakedManufacturerName\s*=.*'    = 'FakedManufacturerName=samsung'
+              'FakedDeviceName\s*=.*'          = 'FakedDeviceName=SM-S711B'
+              'FakedPhoneModel\s*=.*'          = 'FakedPhoneModel=SM-S711B'
+              'FakedAndroidVersion\s*=.*'      = 'FakedAndroidVersion=9'
+              'FakedBrand\s*=.*'               = 'FakedBrand=samsung'
+            }
+            foreach ($pattern in $replacements.Keys) {
+              if ($cfg -match $pattern) {
+                $cfg = $cfg -replace $pattern, $replacements[$pattern]
+              } else {
+                if ($cfg -match '\[PropertySettings\]') {
+                  $cfg = $cfg -replace '(\[PropertySettings\])', "`$1`r`n$($replacements[$pattern])"
+                } else {
+                  $cfg += "`r`n$($replacements[$pattern])"
+                }
+              }
+            }
+            $cfg | Set-Content $vmCfg -Encoding UTF8
+            Write-Host "leidianConfig.ini patched." -ForegroundColor Green
+          } else {
+            Write-Host "leidianConfig.ini not found (VM not initialized yet)." -ForegroundColor Yellow
+          }
+          $ldRoot | Set-Content "C:\ldroot.txt" -Encoding UTF8
+
+      # ══════════════════════════════════════════════
+      #  6. Create Desktop Toolkit
+      # ══════════════════════════════════════════════
+      - name: 6. Create Desktop Toolkit
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+          $ldRoot = "C:\LDPlayer"
+          if (Test-Path "C:\ldroot.txt") {
+            $ldRoot = (Get-Content "C:\ldroot.txt" -Raw).Trim()
+          }
+
+          $startBat = @"
+@echo off
+title Starting Samsung Galaxy S23 FE...
+color 0A
+echo.
+echo  ============================================
+echo   SAMSUNG GALAXY S23 FE  -  Starting...
+echo  ============================================
+echo.
+echo  Step 1: Launching LDPlayer...
+start "" "$ldRoot\dnplayer.exe"
+echo.
+echo  WAIT for the Android home screen to appear
+echo  (usually 1-3 minutes).
+echo.
+echo  Then double-click: SETUP SPOOF.bat
+echo.
+pause
+"@
+          $startBat | Set-Content "$desk\1 - START SAMSUNG PHONE.bat" -Encoding ASCII
+
+          $adbPath = "$ldRoot\adb.exe"
+          $setupBat = @"
+@echo off
+title SETUP SPOOF - Samsung S23 FE Identity
+color 0E
+echo.
+echo  =============================================
+echo   SETUP: Samsung S23 FE Spoof + TextNow
+echo  =============================================
+echo.
+
+set ADB="$adbPath"
+
+echo [1/7] Connecting ADB to LDPlayer...
+%ADB% connect 127.0.0.1:5555
+timeout /t 3 /nobreak >nul
+
+echo [2/7] Getting root...
+%ADB% root
+timeout /t 3 /nobreak >nul
+%ADB% connect 127.0.0.1:5555
+timeout /t 2 /nobreak >nul
+
+echo [3/7] Remounting /system as read-write...
+%ADB% shell mount -o rw,remount /system
+timeout /t 2 /nobreak >nul
+
+echo [4/7] Injecting Samsung S23 FE identity into build.prop...
+%ADB% shell "sed -i 's/ro.product.manufacturer=.*/ro.product.manufacturer=samsung/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.brand=.*/ro.product.brand=samsung/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.model=.*/ro.product.model=SM-S711B/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.name=.*/ro.product.name=SM-S711B/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.device=.*/ro.product.device=s5e9925/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.product=.*/ro.build.product=s5e9925/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.type=.*/ro.build.type=user/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.tags=.*/ro.build.tags=release-keys/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.version.release=.*/ro.build.version.release=14/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.version.security_patch=.*/ro.build.version.security_patch=2024-05-01/' /system/build.prop"
+%ADB% shell "grep -q 'ro.product.manufacturer' /system/build.prop || echo ro.product.manufacturer=samsung >> /system/build.prop"
+%ADB% shell "grep -q 'ro.build.fingerprint' /system/build.prop && sed -i 's|ro.build.fingerprint=.*|ro.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys|' /system/build.prop || echo ro.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys >> /system/build.prop"
+
+echo [5/7] Clearing Google Play Services cache...
+%ADB% shell pm clear com.google.android.gms
+%ADB% shell pm clear com.android.vending
+timeout /t 2 /nobreak >nul
+
+echo [6/7] Downloading TextNow APK...
+powershell -Command "Invoke-WebRequest 'https://d.apkpure.net/b/APK/com.enflick.android.TextNow?nc=arm64-v8a&sr=high' -OutFile 'C:\textnow.apk' -UseBasicParsing -TimeoutSec 60"
+if exist C:\textnow.apk (
+  echo Installing TextNow...
+  %ADB% install -r C:\textnow.apk
+) else (
+  echo TextNow download failed. Install manually from inside the phone.
+)
+
+echo [7/7] Rebooting emulator to apply identity...
+%ADB% reboot
+echo.
+echo  =============================================
+echo   DONE! Emulator rebooting...
+echo.
+echo   After reboot:
+echo   1. Open TextNow app
+echo   2. Create TextNow account
+echo   3. Get your FREE US phone number
+echo   4. Go to Settings > Accounts > Add Account
+echo   5. Add Google account using TextNow number
+echo  =============================================
+echo.
+pause
+"@
+          $setupBat | Set-Content "$desk\2 - SETUP SPOOF.bat" -Encoding ASCII
+
+          $guide = @"
+Samsung S23 FE Virtual Phone - Gmail Creator
+
+STEP 1: Double-click "1 - START SAMSUNG PHONE.bat"
+        Wait for LDPlayer to boot (1-3 min)
+
+STEP 2: Double-click "2 - SETUP SPOOF.bat"
+        Wait for all steps to finish
+        Emulator will reboot automatically
+
+STEP 3: Inside LDPlayer after reboot:
+        Open TextNow app
+        Create account, get US phone number
+
+STEP 4: Settings > Accounts > Add Account > Google
+        Use TextNow number when asked
+        SMS code will appear in TextNow app
+
+Device Identity after SETUP:
+  Brand      : Samsung
+  Model      : SM-S711B (Galaxy S23 FE)
+  Android    : 14
+  Fingerprint: samsung/SM-S711BXXS3AXEF/...release-keys
+"@
+          $guide | Set-Content "$desk\3 - GUIDE (READ THIS FIRST).txt" -Encoding UTF8
+
+          Write-Host "======================================" -ForegroundColor Magenta
+          Write-Host " Desktop toolkit created:" -ForegroundColor Cyan
+          Write-Host "  1 - START SAMSUNG PHONE.bat" -ForegroundColor Yellow
+          Write-Host "  2 - SETUP SPOOF.bat" -ForegroundColor Yellow
+          Write-Host "  3 - GUIDE (READ THIS FIRST).txt" -ForegroundColor Yellow
+          Write-Host "======================================" -ForegroundColor Magenta
+
+      # ══════════════════════════════════════════════
+      #  7. Keep Server Alive
+      # ══════════════════════════════════════════════
+      - name: 7. Keep Server Alive (6 Hours)
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 360; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/360] Server running..."
+          }

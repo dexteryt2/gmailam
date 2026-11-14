@@ -80,6 +80,7 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
 
           $memuInst = "C:\memu_setup.exe"
+          New-Item C:\debug -ItemType Directory -Force | Out-Null
 
           # The old URLs (new_memuplay/setup/..., /cn/setup/...) return 404 now.
           # Current official offline installer lives under /download/
@@ -115,26 +116,190 @@ jobs:
           Write-Host "Downloaded $([math]::Round($sz/1MB,1)) MB in ${elapsed}s." -ForegroundColor Green
 
           Write-Host ">>> Installing MEmu Play silently..." -ForegroundColor Cyan
-          $p = Start-Process $memuInst -ArgumentList "/S" -PassThru
-          # Wait up to 15 min for MEmu.exe to appear (installer can spawn child processes)
-          $memuExe = $null
-          $deadline = (Get-Date).AddMinutes(15)
-          while ((Get-Date) -lt $deadline) {
-            $memuExe = Get-ChildItem "C:\Program Files\Microvirt", "C:\Program Files (x86)\Microvirt" `
-                         -Filter "MEmu.exe" -Recurse -ErrorAction SilentlyContinue |
-                         Select-Object -First 1
-            if ($memuExe -and $p.HasExited) { break }
-            Start-Sleep 10
+
+          function Find-Memu {
+            # Search ALL fixed drives (runner has C: and D:), not only C:\Program Files
+            $roots = @()
+            foreach ($d in (Get-PSDrive -PSProvider FileSystem)) {
+              foreach ($sub in "Program Files\Microvirt","Program Files (x86)\Microvirt","Microvirt","MEmu") {
+                $r = Join-Path $d.Root $sub
+                if (Test-Path $r) { $roots += $r }
+              }
+            }
+            foreach ($r in $roots) {
+              $f = Get-ChildItem $r -Filter "MEmu.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($f) { return $f }
+            }
+            # Registry fallback (uninstall entry)
+            $keys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            $e = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DisplayName -like "*MEmu*" } | Select-Object -First 1
+            if ($e -and $e.InstallLocation -and (Test-Path "$($e.InstallLocation)\MEmu.exe")) {
+              return Get-Item "$($e.InstallLocation)\MEmu.exe"
+            }
+            return $null
           }
-          Start-Sleep 10
+
+          $p = Start-Process $memuInst -ArgumentList "/S" -PassThru
+          $memuExe = $null
+          $deadline = (Get-Date).AddMinutes(10)
+          $tick = 0
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep 15
+            $tick++
+            $memuExe = Find-Memu
+            if ($memuExe) { break }
+            if ($tick % 4 -eq 0) {
+              $alive = if ($p.HasExited) { "exited (code $($p.ExitCode))" } else { "still running" }
+              Write-Host "[$($tick*15)s] installer $alive, MEmu.exe not found yet..."
+            }
+            # installer finished but nothing installed -> stop waiting early
+            if ($p.HasExited -and $tick -ge 8) { break }
+          }
 
           if ($memuExe) {
             Write-Host "MEmu installed: $($memuExe.FullName)" -ForegroundColor Green
+            Start-Sleep 10
           } else {
-            Write-Host "##[error] MEmu.exe not found after install."
-            Get-ChildItem "C:\Program Files" -Directory | Select-Object -ExpandProperty Name
+            Write-Host "##[error] MEmu.exe not found after install. Diagnostics:"
+            Write-Host "Installer exited: $($p.HasExited)  code: $(if ($p.HasExited) { $p.ExitCode } else { 'n/a' })"
+            Write-Host "--- related processes ---"
+            Get-Process | Where-Object { $_.Name -match 'memu|microvirt|setup|install|vbox' } |
+              Format-Table Name, Id, Path -AutoSize | Out-String | Write-Host
+            Write-Host "--- drives ---"
+            Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free, Root -AutoSize | Out-String | Write-Host
+            Write-Host "--- any Microvirt/MEmu folders ---"
+            foreach ($d in (Get-PSDrive -PSProvider FileSystem)) {
+              Get-ChildItem $d.Root -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'memu|microvirt' } | ForEach-Object { $_.FullName }
+            }
+            Write-Host "--- recent Windows Application errors ---"
+            Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-15)} `
+              -MaxEvents 8 -ErrorAction SilentlyContinue | Format-List TimeCreated, ProviderName, Message | Out-String | Write-Host
+
+            Write-Host "--- windows with a title (is the installer waiting on a GUI?) ---"
+            Get-Process | Where-Object { $_.MainWindowTitle } |
+              Select-Object Name, Id, MainWindowTitle | Format-Table -AutoSize | Out-String | Write-Host
+
+            Write-Host "--- installer file type (7-Zip listing, first 40 lines) ---"
+            $sevenZ = "C:\Program Files\7-Zip\7z.exe"
+            if (Test-Path $sevenZ) { & $sevenZ l $memuInst 2>&1 | Select-Object -First 40 | ForEach-Object { Write-Host $_ } }
+            $fs = [System.IO.File]::OpenRead($memuInst); $buf = New-Object byte[] 4; [void]$fs.Read($buf, 0, 4); $fs.Close()
+            $hdr = $buf -join ","
+            Write-Host "First bytes: $hdr  (77,90 = valid Windows exe)"
+
+            Write-Host "--- screenshot + installer logs saved to C:\debug (uploaded as artifact) ---"
+            try {
+              Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+              $bmp.Save("C:\debug\screen_install.png")
+            } catch { Write-Host "Screenshot failed: $_" }
+            Get-ChildItem $env:TEMP, "C:\Windows\Temp" -Recurse -Include *.log, *memu*, *microvirt* -ErrorAction SilentlyContinue |
+              Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) -and -not $_.PSIsContainer } |
+              ForEach-Object { Copy-Item $_.FullName "C:\debug\$($_.Name)" -Force -ErrorAction SilentlyContinue }
             exit 1
           }
+
+      # ══════════════════════════════════════════════
+      #  4b. Virtualization diagnostics + MEmu boot test
+      #  (tells you EXACTLY whether Hyper-V / VT-x blocks MEmu)
+      # ══════════════════════════════════════════════
+      - name: 4b. Virtualization Diagnostics and MEmu Boot Test
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item C:\debug -ItemType Directory -Force | Out-Null
+          Start-Transcript -Path C:\debug\4b_boot_test.txt -Force | Out-Null
+
+          Write-Host "===== CPU / hypervisor =====" -ForegroundColor Cyan
+          Get-CimInstance Win32_ComputerSystem | Format-List Manufacturer, Model, HypervisorPresent | Out-String | Write-Host
+          Get-CimInstance Win32_Processor | Format-List Name, NumberOfCores, VirtualizationFirmwareEnabled, SecondLevelAddressTranslationExtensions | Out-String | Write-Host
+          Write-Host "bcdedit hypervisor setting:"
+          bcdedit /enum "{current}" | Select-String -Pattern "hypervisor" | ForEach-Object { Write-Host $_ }
+          Write-Host "Windows features:"
+          Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.FeatureName -match 'Hyper-V|HypervisorPlatform|VirtualMachinePlatform' -and $_.State -eq 'Enabled' } |
+            Format-Table FeatureName, State -AutoSize | Out-String | Write-Host
+          Write-Host "Hyper-V services:"
+          Get-Service vmms, hvhost, vmcompute -ErrorAction SilentlyContinue | Format-Table Name, Status -AutoSize | Out-String | Write-Host
+
+          # ---- locate MEmu ----
+          $memuExe = $null
+          foreach ($d in (Get-PSDrive -PSProvider FileSystem)) {
+            foreach ($sub in "Program Files\Microvirt","Program Files (x86)\Microvirt","Microvirt","MEmu") {
+              $r = Join-Path $d.Root $sub
+              if (-not $memuExe -and (Test-Path $r)) {
+                $memuExe = Get-ChildItem $r -Filter "MEmu.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              }
+            }
+          }
+          if (-not $memuExe) { Write-Host "##[error] MEmu.exe not found"; Stop-Transcript | Out-Null; exit 1 }
+          $root   = $memuExe.DirectoryName
+          $memuc  = Join-Path $root "memuc.exe"
+          $manage = Join-Path $root "MEmuManage.exe"
+          $adb    = (Get-ChildItem $root -Filter adb.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          Write-Host "MEmu root: $root"
+          Write-Host "memuc: $(Test-Path $memuc)  manage: $(Test-Path $manage)  adb: $adb"
+
+          Write-Host "===== VM list =====" -ForegroundColor Cyan
+          if (Test-Path $memuc)  { & $memuc listvms 2>&1 | ForEach-Object { Write-Host $_ } }
+          if (Test-Path $manage) { & $manage list vms 2>&1 | ForEach-Object { Write-Host $_ } }
+
+          Write-Host "===== Boot test (max 4 min) =====" -ForegroundColor Cyan
+          $started = $false
+          if (Test-Path $memuc) {
+            $sp = Start-Process $memuc -ArgumentList "start -i 0" -PassThru -WindowStyle Hidden
+            $sp | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
+          } else {
+            Start-Process $memuExe.FullName -WindowStyle Hidden
+          }
+          $booted = $false
+          for ($i = 1; $i -le 16; $i++) {
+            Start-Sleep 15
+            if ($adb) {
+              & $adb connect 127.0.0.1:21503 2>&1 | Out-Null
+              $bc = (& $adb -s 127.0.0.1:21503 shell getprop sys.boot_completed 2>&1 | Out-String).Trim()
+            } else { $bc = "no-adb" }
+            Write-Host "[$($i*15)s] boot_completed = '$bc'"
+            if ($bc -eq "1") { $booted = $true; break }
+          }
+
+          Write-Host "===== Result =====" -ForegroundColor Cyan
+          if ($booted) {
+            Write-Host "BOOT OK - MEmu runs on this runner." -ForegroundColor Green
+            if ($adb) { & $adb -s 127.0.0.1:21503 shell getprop ro.product.model 2>&1 | ForEach-Object { Write-Host "Android model: $_" } }
+          } else {
+            Write-Host "BOOT FAILED. Likely cause if HypervisorPresent=True / hypervisor feature enabled above: Hyper-V blocks MEmu's VirtualBox engine." -ForegroundColor Red
+            Write-Host "--- MEmu / VirtualBox logs (last 60 lines each) ---"
+            Get-ChildItem $root, "$env:USERPROFILE\.MEmu", "$env:USERPROFILE\.Microvirt", "$env:USERPROFILE\.VirtualBox" -Recurse -Include *.log -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 4 | ForEach-Object {
+                Write-Host "##### $($_.FullName)"
+                Get-Content $_.FullName -Tail 60 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+                Copy-Item $_.FullName "C:\debug\$($_.Name)" -Force -ErrorAction SilentlyContinue
+              }
+            Get-Process | Where-Object { $_.Name -match 'memu|vbox|microvirt' } | Format-Table Name, Id -AutoSize | Out-String | Write-Host
+          }
+          try {
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $bmp.Save("C:\debug\screen_boot.png")
+          } catch { Write-Host "Screenshot failed: $_" }
+          Stop-Transcript | Out-Null
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: C:\debug\
+          if-no-files-found: ignore
 
       # ══════════════════════════════════════════════
       #  5. Find paths and create desktop tools
@@ -145,8 +310,16 @@ jobs:
           $desk = "C:\Users\Public\Desktop"
 
           # Locate MEmu.exe
-          $memuExe = Get-ChildItem "C:\" -Filter "MEmu.exe" -Recurse `
-                       -ErrorAction SilentlyContinue | Select-Object -First 1
+          $memuExe = $null
+          foreach ($d in (Get-PSDrive -PSProvider FileSystem)) {
+            foreach ($sub in "Program Files\Microvirt","Program Files (x86)\Microvirt","Microvirt","MEmu") {
+              $r = Join-Path $d.Root $sub
+              if (-not $memuExe -and (Test-Path $r)) {
+                $memuExe = Get-ChildItem $r -Filter "MEmu.exe" -Recurse `
+                             -ErrorAction SilentlyContinue | Select-Object -First 1
+              }
+            }
+          }
           if (-not $memuExe) {
             Write-Host "##[error] MEmu.exe not found!"
             exit 1

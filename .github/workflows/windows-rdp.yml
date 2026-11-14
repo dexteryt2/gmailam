@@ -273,11 +273,16 @@ jobs:
           $booted = $false
           if (-not (Test-Path $memuc)) { Write-Host "##[error] memuc.exe missing"; Stop-Transcript | Out-Null; exit 1 }
 
-          # Attempt 1: default settings
-          $booted = Test-Boot "default (OpenGL)" 150
+          # CONFIRMED by real run: OpenGL render mode hangs/crashes on the runner (no GPU),
+          # DirectX (graphics_render_mode=1) boots in ~15 s. So set DirectX FIRST (persists in VM config).
+          & $memuc stop -i 0 2>&1 | Out-Null
+          Start-Sleep 5
+          & $memuc setconfigex -i 0 graphics_render_mode 1 2>&1 | ForEach-Object { Write-Host "setconfigex: $_" }
+          & $memuc getconfigex -i 0 graphics_render_mode   2>&1 | ForEach-Object { Write-Host "getconfigex: $_" }
+          $booted = Test-Boot "DirectX (graphics_render_mode=1)" 150
 
-          # Attempt 2/3: switch renderer to DirectX (try both known key spellings, print what memuc says)
-          foreach ($key in "graphics_render_mode", "graphic_render_mode") {
+          # Fallback only if that somehow failed: try the other key spelling
+          foreach ($key in "graphic_render_mode") {
             if ($booted) { break }
             Write-Host "--- setting $key = 1 (DirectX) ---" -ForegroundColor Yellow
             & $memuc stop -i 0 2>&1 | Out-Null

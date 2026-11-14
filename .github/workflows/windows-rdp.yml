@@ -249,38 +249,59 @@ jobs:
           if (Test-Path $memuc)  { & $memuc listvms 2>&1 | ForEach-Object { Write-Host $_ } }
           if (Test-Path $manage) { & $manage list vms 2>&1 | ForEach-Object { Write-Host $_ } }
 
-          Write-Host "===== Boot test (max 4 min) =====" -ForegroundColor Cyan
-          $started = $false
-          if (Test-Path $memuc) {
+          # NOTE from the first real run: MEmu uses WinHvPlatform (it supports Hyper-V),
+          # so Hyper-V is NOT the blocker. The VM crashed inside libOpenglRender.dll
+          # (OpenGL renderer; the runner has no GPU). So we retry with DirectX rendering.
+          function Test-Boot($label, $maxSec) {
+            Write-Host "===== Boot test: $label (max $maxSec s) =====" -ForegroundColor Cyan
+            & $memuc stop -i 0 2>&1 | Out-Null
+            Start-Sleep 8
             $sp = Start-Process $memuc -ArgumentList "start -i 0" -PassThru -WindowStyle Hidden
             $sp | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
-          } else {
-            Start-Process $memuExe.FullName -WindowStyle Hidden
-          }
-          $booted = $false
-          for ($i = 1; $i -le 16; $i++) {
-            Start-Sleep 15
-            if ($adb) {
+            for ($i = 1; $i -le [int]($maxSec / 15); $i++) {
+              Start-Sleep 15
               & $adb connect 127.0.0.1:21503 2>&1 | Out-Null
-              $bc = (& $adb -s 127.0.0.1:21503 shell getprop sys.boot_completed 2>&1 | Out-String).Trim()
-            } else { $bc = "no-adb" }
-            Write-Host "[$($i*15)s] boot_completed = '$bc'"
-            if ($bc -eq "1") { $booted = $true; break }
+              $bc  = (& $adb -s 127.0.0.1:21503 shell getprop sys.boot_completed 2>&1 | Out-String).Trim()
+              $run = (& $memuc isvmrunning -i 0 2>&1 | Out-String).Trim()
+              Write-Host "[$($i*15)s] vm_running='$run' boot_completed='$bc'"
+              if ($bc -eq "1") { return $true }
+              if ($i -ge 3 -and $run -match '(?i)not running') { Write-Host "VM process died early."; return $false }
+            }
+            return $false
+          }
+
+          $booted = $false
+          if (-not (Test-Path $memuc)) { Write-Host "##[error] memuc.exe missing"; Stop-Transcript | Out-Null; exit 1 }
+
+          # Attempt 1: default settings
+          $booted = Test-Boot "default (OpenGL)" 150
+
+          # Attempt 2/3: switch renderer to DirectX (try both known key spellings, print what memuc says)
+          foreach ($key in "graphics_render_mode", "graphic_render_mode") {
+            if ($booted) { break }
+            Write-Host "--- setting $key = 1 (DirectX) ---" -ForegroundColor Yellow
+            & $memuc stop -i 0 2>&1 | Out-Null
+            Start-Sleep 5
+            & $memuc setconfigex -i 0 $key 1 2>&1 | ForEach-Object { Write-Host "setconfigex: $_" }
+            & $memuc setconfig   -i 0 $key 1 2>&1 | ForEach-Object { Write-Host "setconfig  : $_" }
+            & $memuc getconfigex -i 0 $key   2>&1 | ForEach-Object { Write-Host "getconfigex: $_" }
+            $booted = Test-Boot "DirectX via $key" 150
           }
 
           Write-Host "===== Result =====" -ForegroundColor Cyan
           if ($booted) {
             Write-Host "BOOT OK - MEmu runs on this runner." -ForegroundColor Green
-            if ($adb) { & $adb -s 127.0.0.1:21503 shell getprop ro.product.model 2>&1 | ForEach-Object { Write-Host "Android model: $_" } }
+            & $adb -s 127.0.0.1:21503 shell getprop ro.product.model 2>&1 | ForEach-Object { Write-Host "Android model: $_" }
           } else {
-            Write-Host "BOOT FAILED. Likely cause if HypervisorPresent=True / hypervisor feature enabled above: Hyper-V blocks MEmu's VirtualBox engine." -ForegroundColor Red
-            Write-Host "--- MEmu / VirtualBox logs (last 60 lines each) ---"
-            Get-ChildItem $root, "$env:USERPROFILE\.MEmu", "$env:USERPROFILE\.Microvirt", "$env:USERPROFILE\.VirtualBox" -Recurse -Include *.log -ErrorAction SilentlyContinue |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 4 | ForEach-Object {
-                Write-Host "##### $($_.FullName)"
-                Get-Content $_.FullName -Tail 60 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-                Copy-Item $_.FullName "C:\debug\$($_.Name)" -Force -ErrorAction SilentlyContinue
-              }
+            Write-Host "BOOT FAILED even with DirectX. See the crash summary below." -ForegroundColor Red
+            $logs = Get-ChildItem $root -Recurse -Include *.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+            foreach ($lg in $logs) {
+              Write-Host "##### $($lg.FullName)"
+              Write-Host "--- first exception / error lines ---"
+              Select-String -Path $lg.FullName -Pattern 'Xcpt|Exception|exception code|Fatal|VERR_|NEM|WHPX|Failed' -ErrorAction SilentlyContinue |
+                Select-Object -First 15 | ForEach-Object { Write-Host $_.Line }
+              Copy-Item $lg.FullName "C:\debug\$($lg.Name)" -Force -ErrorAction SilentlyContinue
+            }
             Get-Process | Where-Object { $_.Name -match 'memu|vbox|microvirt' } | Format-Table Name, Id -AutoSize | Out-String | Write-Host
           }
           try {

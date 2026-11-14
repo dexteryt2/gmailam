@@ -1,0 +1,411 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ══════════════════════════════════════════════════════
+      #  STEP 1 — Enable Remote Desktop
+      # ══════════════════════════════════════════════════════
+      - name: 1. Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 0
+          Write-Host "RDP enabled."
+
+      # ══════════════════════════════════════════════════════
+      #  STEP 2 — Create admin account
+      # ══════════════════════════════════════════════════════
+      - name: 2. Create Admin Account
+        shell: pwsh
+        run: |
+          $pw = ConvertTo-SecureString "Nexouya2026RdpX7" -AsPlainText -Force
+          New-LocalUser -Name "NexAdmin" -Password $pw -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "NexAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Nexouya2026RdpX7
+          Write-Host "Accounts ready."
+
+      # ══════════════════════════════════════════════════════
+      #  STEP 3 — Tailscale VPN
+      # ══════════════════════════════════════════════════════
+      - name: 3. Install & Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "C:\ts.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i C:\ts.msi /quiet /norestart" -Wait
+          Start-Sleep 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp"
+          Start-Sleep 8
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host ""
+          Write-Host "======================================" -ForegroundColor Green
+          Write-Host "  Tailscale IP : $ip"               -ForegroundColor Yellow
+          Write-Host "  Username     : NexAdmin"           -ForegroundColor Yellow
+          Write-Host "  Password     : Nexouya2026RdpX7"  -ForegroundColor Yellow
+          Write-Host "======================================" -ForegroundColor Green
+
+      # ══════════════════════════════════════════════════════
+      #  STEP 4 — Install LDPlayer 9
+      #
+      #  Three attempts, in order:
+      #  A) winget  (pre-installed, most reliable)
+      #  B) Direct CDN download with proper Referer/UA headers
+      #  C) Alternative CDN mirror
+      # ══════════════════════════════════════════════════════
+      - name: 4. Install LDPlayer 9
+        shell: pwsh
+        run: |
+          $installed = $false
+
+          # ── A: winget ─────────────────────────────────────────────────────
+          Write-Host ">>> [A] Trying winget..." -ForegroundColor Cyan
+          try {
+            # winget needs source refresh first
+            winget source update --disable-interactivity | Out-Null
+
+            $wg = winget install `
+              --id LDPlayer.LDPlayer9 `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements `
+              --disable-interactivity 2>&1
+
+            # check if install succeeded by looking for dnplayer.exe
+            Start-Sleep 10
+            $found = Get-ChildItem "C:\" -Filter "dnplayer.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($found) {
+              Write-Host "winget install OK -> $($found.FullName)" -ForegroundColor Green
+              $installed = $true
+            } else {
+              Write-Host "winget finished but dnplayer.exe not found, trying LDPlayer.LDPlayer..." -ForegroundColor Yellow
+              winget install `
+                --id LDPlayer.LDPlayer `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity 2>&1 | Out-Null
+              Start-Sleep 10
+              $found2 = Get-ChildItem "C:\" -Filter "dnplayer.exe" -Recurse -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+              if ($found2) {
+                Write-Host "winget (LDPlayer.LDPlayer) OK -> $($found2.FullName)" -ForegroundColor Green
+                $installed = $true
+              }
+            }
+          } catch {
+            Write-Host "winget failed: $_" -ForegroundColor Yellow
+          }
+
+          # ── B: Direct CDN with browser headers ────────────────────────────
+          if (-not $installed) {
+            Write-Host ">>> [B] Trying direct CDN with headers..." -ForegroundColor Cyan
+            $headers = @{
+              'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+              'Referer'    = 'https://www.ldplayer.net/'
+              'Accept'     = '*/*'
+            }
+            $cdnUrls = @(
+              "https://encdn.ldmnq.com/download/package/LDPlayer9_en_installer.exe",
+              "https://encdn.ldmnq.com/download/package/LDPlayer9_Setup_enOff.exe",
+              "https://cdn.ldplayer.net/download/LDPlayer9_en_installer.exe",
+              "https://dl.ldplayer.net/package/LDPlayer9_en_installer.exe"
+            )
+            foreach ($url in $cdnUrls) {
+              try {
+                Write-Host "  Trying: $url" -ForegroundColor Gray
+                Invoke-WebRequest $url -OutFile "C:\ld9setup.exe" `
+                  -Headers $headers -UseBasicParsing -TimeoutSec 180
+                $sz = (Get-Item "C:\ld9setup.exe").Length
+                if ($sz -gt 1MB) {
+                  Write-Host "  Downloaded ($([math]::Round($sz/1MB,1)) MB). Installing..." -ForegroundColor Green
+                  Start-Process "C:\ld9setup.exe" -ArgumentList "--silent" -Wait
+                  Start-Sleep 15
+                  $found = Get-ChildItem "C:\" -Filter "dnplayer.exe" -Recurse -ErrorAction SilentlyContinue |
+                           Select-Object -First 1
+                  if ($found) {
+                    Write-Host "  CDN install OK -> $($found.FullName)" -ForegroundColor Green
+                    $installed = $true
+                    break
+                  }
+                } else {
+                  Write-Host "  File too small ($sz bytes), skipping." -ForegroundColor Yellow
+                }
+              } catch {
+                Write-Host "  Failed: $_" -ForegroundColor Yellow
+              }
+            }
+          }
+
+          # ── C: Bits-Transfer fallback ──────────────────────────────────────
+          if (-not $installed) {
+            Write-Host ">>> [C] Trying BITS transfer..." -ForegroundColor Cyan
+            try {
+              Start-BitsTransfer `
+                -Source "https://encdn.ldmnq.com/download/package/LDPlayer9_en_installer.exe" `
+                -Destination "C:\ld9bits.exe" `
+                -TransferType Download `
+                -ErrorAction Stop
+              $sz = (Get-Item "C:\ld9bits.exe").Length
+              if ($sz -gt 1MB) {
+                Write-Host "BITS download OK. Installing..." -ForegroundColor Green
+                Start-Process "C:\ld9bits.exe" -ArgumentList "--silent" -Wait
+                Start-Sleep 15
+                $found = Get-ChildItem "C:\" -Filter "dnplayer.exe" -Recurse -ErrorAction SilentlyContinue |
+                         Select-Object -First 1
+                if ($found) {
+                  Write-Host "BITS install OK -> $($found.FullName)" -ForegroundColor Green
+                  $installed = $true
+                }
+              }
+            } catch {
+              Write-Host "BITS failed: $_" -ForegroundColor Yellow
+            }
+          }
+
+          # ── Final check ───────────────────────────────────────────────────
+          if (-not $installed) {
+            Write-Host "##[error] LDPlayer could not be installed via any method." -ForegroundColor Red
+            exit 1
+          }
+
+          Write-Host "LDPlayer 9 is installed." -ForegroundColor Green
+
+      # ══════════════════════════════════════════════════════
+      #  STEP 5 — Find LDPlayer paths & create desktop tools
+      # ══════════════════════════════════════════════════════
+      - name: 5. Configure & Create Desktop Tools
+        shell: pwsh
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+
+          # ── Locate dnplayer.exe ───────────────────────────────────────────
+          $dnplayer = Get-ChildItem "C:\" -Filter "dnplayer.exe" -Recurse -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          if (-not $dnplayer) {
+            Write-Host "##[error] dnplayer.exe not found after install!" -ForegroundColor Red
+            exit 1
+          }
+          $ldRoot  = $dnplayer.DirectoryName
+          $dnPath  = $dnplayer.FullName
+
+          # ── Locate adb.exe (inside LDPlayer folder) ───────────────────────
+          $adbExe = Get-ChildItem $ldRoot -Filter "adb.exe" -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $adbExe) {
+            # sometimes in a subfolder
+            $adbExe = Get-ChildItem $ldRoot -Filter "adb.exe" -Recurse -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          }
+          $adbPath = if ($adbExe) { $adbExe.FullName } else { "$ldRoot\adb.exe" }
+
+          Write-Host "LDPlayer root : $ldRoot"  -ForegroundColor Cyan
+          Write-Host "dnplayer.exe  : $dnPath"   -ForegroundColor Cyan
+          Write-Host "adb.exe       : $adbPath"  -ForegroundColor Cyan
+
+          # Save paths for reference
+          @{ldRoot=$ldRoot; dnplayer=$dnPath; adb=$adbPath} |
+            ConvertTo-Json | Set-Content "C:\ldpaths.json" -Encoding UTF8
+
+          # ══════════════════════════════════════════════════
+          #  FILE 1: 1 - START SAMSUNG PHONE.bat
+          # ══════════════════════════════════════════════════
+          @"
+@echo off
+title Samsung Galaxy S23 FE - Virtual Phone
+color 0A
+echo.
+echo  =========================================================
+echo   SAMSUNG GALAXY S23 FE  -  Starting LDPlayer 9...
+echo  =========================================================
+echo.
+echo  Launching...
+start "" "$dnPath"
+echo.
+echo  WAIT until the Android home screen appears (1-3 min).
+echo  Then close this window and run:
+echo     2 - SETUP SPOOF.bat
+echo.
+pause
+"@ | Set-Content "$desk\1 - START SAMSUNG PHONE.bat" -Encoding ASCII
+
+          # ══════════════════════════════════════════════════
+          #  FILE 2: 2 - SETUP SPOOF.bat
+          #  Run AFTER LDPlayer boots to Android home screen
+          # ══════════════════════════════════════════════════
+          @"
+@echo off
+title SETUP: Samsung S23 FE Identity + TextNow
+color 0E
+set ADB="$adbPath"
+
+echo.
+echo  =========================================================
+echo   Samsung S23 FE Identity Setup
+echo   Run this AFTER LDPlayer shows the Android home screen
+echo  =========================================================
+echo.
+
+:: ── 1. Connect ADB ────────────────────────────────────────
+echo [1/8] Connecting ADB to LDPlayer...
+%ADB% connect 127.0.0.1:5555 2>nul
+if errorlevel 1 (
+  echo       Port 5555 failed, trying 5554...
+  %ADB% connect 127.0.0.1:5554 2>nul
+)
+timeout /t 3 /nobreak >nul
+
+:: ── 2. Get root ────────────────────────────────────────────
+echo [2/8] Getting root shell...
+%ADB% root
+timeout /t 4 /nobreak >nul
+%ADB% connect 127.0.0.1:5555 2>nul
+timeout /t 2 /nobreak >nul
+
+:: ── 3. Remount /system ────────────────────────────────────
+echo [3/8] Remounting /system as read-write...
+%ADB% shell mount -o rw,remount /system
+timeout /t 2 /nobreak >nul
+
+:: ── 4. Inject Samsung S23 FE identity ────────────────────
+echo [4/8] Injecting Samsung Galaxy S23 FE identity...
+
+:: Replace existing values
+%ADB% shell "sed -i 's/ro.product.manufacturer=.*/ro.product.manufacturer=samsung/' /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.brand=.*/ro.product.brand=samsung/'               /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.model=.*/ro.product.model=SM-S711B/'               /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.name=.*/ro.product.name=SM-S711B/'                 /system/build.prop"
+%ADB% shell "sed -i 's/ro.product.device=.*/ro.product.device=s5e9925/'              /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.product=.*/ro.build.product=s5e9925/'                /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.type=.*/ro.build.type=user/'                         /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.tags=.*/ro.build.tags=release-keys/'                 /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.version.release=.*/ro.build.version.release=14/'     /system/build.prop"
+%ADB% shell "sed -i 's/ro.build.version.security_patch=.*/ro.build.version.security_patch=2024-05-01/' /system/build.prop"
+
+:: Add if not present
+%ADB% shell "grep -q 'ro.product.manufacturer' /system/build.prop || echo ro.product.manufacturer=samsung >> /system/build.prop"
+%ADB% shell "grep -q 'ro.product.model'        /system/build.prop || echo ro.product.model=SM-S711B       >> /system/build.prop"
+%ADB% shell "grep -q 'ro.build.fingerprint'    /system/build.prop && sed -i 's|ro.build.fingerprint=.*|ro.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys|' /system/build.prop || echo ro.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys >> /system/build.prop"
+%ADB% shell "grep -q 'ro.vendor.build.fingerprint' /system/build.prop || echo ro.vendor.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys >> /system/build.prop"
+
+timeout /t 2 /nobreak >nul
+
+:: ── 5. Clear Google services cache (force re-read identity) ──
+echo [5/8] Clearing Google Play Services cache...
+%ADB% shell pm clear com.google.android.gms
+%ADB% shell pm clear com.android.vending
+timeout /t 2 /nobreak >nul
+
+:: ── 6. Download TextNow APK ───────────────────────────────
+echo [6/8] Downloading TextNow (free US number app)...
+powershell -Command "try { Invoke-WebRequest 'https://d.apkpure.net/b/APK/com.enflick.android.TextNow' -OutFile 'C:\textnow.apk' -UseBasicParsing -TimeoutSec 90 } catch { Write-Host 'Download failed' }"
+timeout /t 3 /nobreak >nul
+
+:: ── 7. Install TextNow ────────────────────────────────────
+echo [7/8] Installing TextNow APK...
+if exist C:\textnow.apk (
+  %ADB% install -r C:\textnow.apk
+  echo       TextNow installed OK
+) else (
+  echo       APK not downloaded - install manually from Play Store inside LDPlayer
+)
+
+:: ── 8. Reboot emulator ────────────────────────────────────
+echo [8/8] Rebooting LDPlayer to apply Samsung identity...
+%ADB% reboot
+echo.
+echo  =========================================================
+echo   Done! LDPlayer is rebooting...
+echo.
+echo   After reboot:
+echo   1. Open TextNow app inside LDPlayer
+echo   2. Create TextNow account (free US number)
+echo   3. Settings > Accounts > Add Account > Google
+echo   4. Use the TextNow number when asked for phone
+echo   5. SMS code will appear in TextNow app
+echo  =========================================================
+echo.
+pause
+"@ | Set-Content "$desk\2 - SETUP SPOOF.bat" -Encoding ASCII
+
+          # ══════════════════════════════════════════════════
+          #  FILE 3: 3 - GUIDE.txt
+          # ══════════════════════════════════════════════════
+          @"
+╔══════════════════════════════════════════════════════════════╗
+║          SAMSUNG S23 FE - GMAIL CREATOR GUIDE               ║
+║          راهنمای ساخت جیمیل بدون ارور                       ║
+╚══════════════════════════════════════════════════════════════╝
+
+چرا کار می کنه؟
+  Google 3 چیز چک می کنه:
+  [1] دستگاه واقعیه؟      ← با Samsung S23 FE spoof حل شد
+  [2] SIM کارت داری؟      ← با TextNow (شماره رایگان US) حل میشه
+  [3] ربات هستی؟          ← تو خودت کلیک می کنی
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+مراحل:
+
+  STEP 1  →  "1 - START SAMSUNG PHONE.bat" رو اجرا کن
+             صبر کن تا Android بیاد بالا (1-3 دقیقه)
+
+  STEP 2  →  "2 - SETUP SPOOF.bat" رو اجرا کن
+             چند دقیقه صبر کن تا تموم بشه
+             LDPlayer خودکار ری‌استارت میشه
+
+  STEP 3  →  بعد از ری‌استارت، اپ TextNow رو باز کن
+             اکانت TextNow بساز (با هر ایمیلی)
+             شماره رایگان آمریکا بگیر
+
+  STEP 4  →  در LDPlayer برو به:
+             Settings > Accounts > Add Account > Google
+             (از Settings گوشی، نه مرورگر!)
+             وقتی شماره خواست: شماره TextNow بده
+             کد SMS توی اپ TextNow میاد
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Device identity after SETUP:
+  Model       : Samsung Galaxy S23 FE (SM-S711B)
+  Android     : 14
+  Fingerprint : samsung/.../release-keys
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+نکته: برنامه های دیگه روی دسکتاپ (Unity, Firefox, Chrome...)
+      از خود GitHub Actions image هستن، ما اونا رو نصب نکردیم.
+"@ | Set-Content "$desk\3 - GUIDE (READ FIRST).txt" -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "=====================================" -ForegroundColor Magenta
+          Write-Host " Desktop toolkit created:"            -ForegroundColor Cyan
+          Write-Host "  1 - START SAMSUNG PHONE.bat"       -ForegroundColor Yellow
+          Write-Host "  2 - SETUP SPOOF.bat"               -ForegroundColor Yellow
+          Write-Host "  3 - GUIDE (READ FIRST).txt"        -ForegroundColor Yellow
+          Write-Host "=====================================" -ForegroundColor Magenta
+
+      # ══════════════════════════════════════════════════════
+      #  STEP 6 — Keep server alive (6 hours)
+      # ══════════════════════════════════════════════════════
+      - name: 6. Keep Server Alive
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 360; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/360] Server alive..."
+          }

@@ -142,8 +142,26 @@ jobs:
               Write-Host "    still installing... ${t}s" -ForegroundColor Gray
               if ($t -gt 900) { Write-Host "Timeout — killing installer."; $proc.Kill(); break }
             }
-            Start-Sleep 10
-            $f = Find-Exe "MEmu.exe"
+            Write-Host ("  installer exit code: {0}" -f $(try { $proc.ExitCode } catch { "n/a" }))
+            # FIX: the installer parent process can exit while setup keeps working in a child process,
+            # so poll for MEmu.exe (known folders first) instead of one search after 10 seconds.
+            $f = $null; $idle = 0
+            for ($w = 0; $w -lt 40 -and -not $f; $w++) {
+              foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+                foreach ($sub in "Program Files\Microvirt\MEmu","Program Files (x86)\Microvirt\MEmu","Microvirt\MEmu","MEmu") {
+                  $pp = Join-Path $d.Root "$sub\MEmu.exe"
+                  if (Test-Path $pp) { $f = Get-Item $pp; break }
+                }
+                if ($f) { break }
+              }
+              if ($f) { break }
+              $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'memu|microvirt|msiexec|setup' -and $_.Name -notmatch 'tailscale' })
+              if ($busy.Count -eq 0) { $idle++ } else { $idle = 0 }
+              Write-Host ("    waiting for MEmu files... {0}s (setup processes: {1})" -f ($w*15), (($busy | ForEach-Object { $_.Name }) -join ','))
+              if ($idle -ge 6) { break }   # nothing is installing any more
+              Start-Sleep 15
+            }
+            if (-not $f) { $f = Find-Exe "MEmu.exe" }
             if ($f) {
               Write-Host ">>> MEmu INSTALLED: $($f.FullName)" -ForegroundColor Green
               $installed=$true; $emulatorType="memu"
@@ -624,7 +642,7 @@ jobs:
             'color 0E',
             "set ADB=`"$adbPath`"",
             "set PORT=$adbPort",
-            "set "MEMUC=$memuConsole"",
+            "set `"MEMUC=$memuConsole`"",
             'echo.',
             'echo  =====================================================',
             'echo   FULL SETUP: Samsung Identity + US SIM + TextNow',
@@ -809,7 +827,7 @@ jobs:
             'echo.',
             'echo [3/3] Opening Google account signup in CHROME browser...',
             'echo   (browser signup does NOT do carrier check!)',
-            '%ADB% shell am start -a android.intent.action.VIEW -d "https://accounts.google.com/signup/v2/webclientchooser?service=mail" com.android.chrome',
+            '%ADB% shell am start -a android.intent.action.VIEW -d "https://accounts.google.com/signup/v2/webclientchooser?service=mail"',
             'timeout /t 3 /nobreak >nul',
             'echo.',
             'echo  =====================================================',
@@ -822,21 +840,21 @@ jobs:
             'echo.',
             'echo   WHEN PHONE NUMBER IS ASKED:',
             'echo   Option A (Free): Enter your TextNow number',
-            'echo     -> TextNow app > check your US number',
-            'echo     -> Enter it here (e.g. +1 234 567 8901)',
-            'echo     -> Get code from TextNow Messages',
+            'echo     Open TextNow app and check your US number',
+            'echo     Enter it here, for example +1 234 567 8901',
+            'echo     Get the code from TextNow Messages',
             'echo.',
-            'echo   Option B (Most reliable, $0.20):',
-            'echo     -> On YOUR PC browser: go to 5sim.net',
-            'echo     -> Buy Google/USA number (~$0.20)',
-            'echo     -> Enter that number here',
-            'echo     -> Get code from 5sim.net website',
+            'echo   Option B - most reliable, about 0.20 USD:',
+            'echo     On YOUR PC browser: go to 5sim.net',
+            'echo     Buy a Google/USA number, about 0.20 USD',
+            'echo     Enter that number here',
+            'echo     Get the code from the 5sim.net website',
             'echo.',
             'echo   Option C (Try skip): look for SKIP link',
-            'echo     -> Some accounts can skip phone verification',
+            'echo     Some accounts can skip phone verification',
             'echo.',
             'echo   IMPORTANT: Use this Chrome browser method',
-            'echo   NOT Settings > Add Account',
+            'echo   NOT Settings, Add Account',
             'echo  =====================================================',
             'echo.',
             'pause'

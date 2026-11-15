@@ -331,6 +331,10 @@ jobs:
             $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
             $bmp.Save("C:\debug\screen_boot.png")
           } catch { Write-Host "Screenshot failed: $_" }
+          # FIX: leave VM fully stopped so the desktop START bat can start it cleanly
+          & $memuc stop -i 0 2>&1 | Out-Null
+          Start-Sleep 8
+          Get-Process -Name MEmu,MEmuHeadless,MEmuSVC -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Stop-Transcript | Out-Null
 
       - name: Upload debug files
@@ -340,6 +344,61 @@ jobs:
           name: debug-${{ github.run_id }}
           path: C:\debug\
           if-no-files-found: ignore
+
+      # ══════════════════════════════════════════════
+      #  4c. scrcpy (phone screen viewer, software rendering)
+      #      + Mesa (software OpenGL, backup for MEmu window)
+      # ══════════════════════════════════════════════
+      - name: 4c. Install scrcpy and Mesa
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force C:\PhoneTools | Out-Null
+          $hdr = @{ "User-Agent" = "gh-runner" }
+
+          # ---- scrcpy ----
+          $urls = @()
+          try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/Genymobile/scrcpy/releases/latest" -Headers $hdr -TimeoutSec 60
+            $a = $rel.assets | Where-Object { $_.name -match '^scrcpy-win64-.*\.zip$' } | Select-Object -First 1
+            if ($a) { $urls += $a.browser_download_url }
+          } catch { Write-Host "GitHub API (scrcpy) failed: $_" -ForegroundColor Yellow }
+          $urls += "https://github.com/Genymobile/scrcpy/releases/download/v3.1/scrcpy-win64-v3.1.zip"
+          $urls += "https://github.com/Genymobile/scrcpy/releases/download/v2.7/scrcpy-win64-v2.7.zip"
+          $scOk = $false
+          foreach ($u in $urls) {
+            try {
+              Write-Host ">>> scrcpy: $u" -ForegroundColor Cyan
+              Invoke-WebRequest $u -OutFile C:\scrcpy.zip -UseBasicParsing -TimeoutSec 300
+              Remove-Item C:\PhoneTools\scrcpy -Recurse -Force -ErrorAction SilentlyContinue
+              Expand-Archive C:\scrcpy.zip -DestinationPath C:\PhoneTools\scrcpy -Force
+              $exe = Get-ChildItem C:\PhoneTools\scrcpy -Filter scrcpy.exe -Recurse | Select-Object -First 1
+              if ($exe) { Write-Host "scrcpy OK: $($exe.FullName)" -ForegroundColor Green; $scOk = $true; break }
+            } catch { Write-Host "scrcpy download failed: $_" -ForegroundColor Yellow }
+          }
+          if (-not $scOk) { Write-Host "scrcpy NOT installed - START will fall back to MEmu window." -ForegroundColor Red }
+
+          # ---- Mesa (software OpenGL) ----
+          try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $hdr -TimeoutSec 60
+            $a = $rel.assets | Where-Object { $_.name -match '^mesa3d-.*release-msvc\.7z$' } | Select-Object -First 1
+            if ($a) {
+              Write-Host ">>> Mesa: $($a.browser_download_url)" -ForegroundColor Cyan
+              Invoke-WebRequest $a.browser_download_url -OutFile C:\mesa.7z -UseBasicParsing -TimeoutSec 600
+              $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+              if (Test-Path $sevenZip) {
+                Remove-Item C:\mesa_tmp -Recurse -Force -ErrorAction SilentlyContinue
+                & $sevenZip x C:\mesa.7z -oC:\mesa_tmp -y | Out-Null
+                New-Item -ItemType Directory -Force C:\PhoneTools\MesaGL | Out-Null
+                foreach ($n in "opengl32.dll","libgallium_wgl.dll","libglapi.dll") {
+                  $f = Get-ChildItem C:\mesa_tmp\x64 -Filter $n -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($f) { Copy-Item $f.FullName C:\PhoneTools\MesaGL\ -Force; Write-Host "  mesa file: $n" }
+                }
+              } else { Write-Host "7-Zip not found - Mesa skipped." -ForegroundColor Yellow }
+            }
+          } catch { Write-Host "Mesa step failed (non-fatal): $_" -ForegroundColor Yellow }
 
       # ══════════════════════════════════════════════
       #  5. Find paths and create desktop tools
@@ -386,8 +445,7 @@ jobs:
           Write-Host "ADB     : $adbPath"     -ForegroundColor Cyan
           Write-Host "Port    : $adbPort"     -ForegroundColor Cyan
           Write-Host "Console : $memuConsole" -ForegroundColor Cyan
-          $memuRoot = $memuExe.DirectoryName
-          $memuPath = $memuExe.FullName
+          $memuRoot = $emuRoot   # FIX v8: $memuExe does not exist in this step (was null)
 
           # Locate adb.exe (MEmu ships its own)
           $adbExe = Get-ChildItem $memuRoot -Filter "adb.exe" -Recurse `
@@ -431,31 +489,61 @@ jobs:
             'if defined MEMUC echo   memuc: %MEMUC%',
             'if defined MEMUE echo   MEmu : %MEMUE%',
             'echo.',
-            'echo [1/3] Stopping any stale MEmu processes...',
-            'taskkill /F /IM MEmu.exe /IM MEmuHeadless.exe /IM MEmuSVC.exe 2>nul',
-            'timeout /t 4 /nobreak >nul',
-            'echo [2/3] Setting DirectX mode and starting Android VM...',
-            'if defined MEMUC (',
-            '  "%MEMUC%" setconfigex -i 0 graphics_render_mode 1',
-            '  timeout /t 2 /nobreak >nul',
-            '  "%MEMUC%" start -i 0',
-            ') else (',
-            '  echo   memuc not found - will try launching MEmu.exe directly',
+            'if not defined MEMUC (',
+            '  echo   ERROR: memuc.exe not found. MEmu is not installed correctly.',
+            '  pause & exit',
             ')',
-            'echo   VM starting - waiting 20 seconds...',
-            'timeout /t 20 /nobreak >nul',
-            'echo [3/3] Opening MEmu display window...',
-            'if defined MEMUE (',
+            "set ADB=`"$adbPath`"",
+            "set PORT=$adbPort",
+            'set ATTEMPT=0',
+            'echo [1/4] Cleanly stopping old MEmu VM...',
+            'taskkill /F /IM scrcpy.exe >nul 2>&1',
+            '"%MEMUC%" stop -i 0 >nul 2>&1',
+            'timeout /t 8 /nobreak >nul',
+            'taskkill /F /IM MEmu.exe /IM MEmuHeadless.exe /IM MEmuSVC.exe >nul 2>&1',
+            'timeout /t 5 /nobreak >nul',
+            'echo [2/4] Setting DirectX mode...',
+            '"%MEMUC%" setconfigex -i 0 graphics_render_mode 1',
+            'timeout /t 2 /nobreak >nul',
+            ':TRYSTART',
+            'set /a ATTEMPT+=1',
+            'echo [3/4] Starting Android VM - attempt %ATTEMPT% of 3...',
+            '"%MEMUC%" start -i 0',
+            'set WAITS=0',
+            ':WAITBOOT',
+            'timeout /t 5 /nobreak >nul',
+            'set /a WAITS+=1',
+            '%ADB% connect 127.0.0.1:%PORT% >nul 2>&1',
+            'set BC=',
+            '%ADB% -s 127.0.0.1:%PORT% shell getprop sys.boot_completed > "%TEMP%\bc.txt" 2>nul',
+            'set /p BC=<"%TEMP%\bc.txt"',
+            'echo   waiting for Android boot... %WAITS%/24',
+            'if "%BC%"=="1" goto BOOTED',
+            'if %WAITS% LSS 24 goto WAITBOOT',
+            'echo   VM did not boot - cleaning up...',
+            '"%MEMUC%" stop -i 0 >nul 2>&1',
+            'timeout /t 8 /nobreak >nul',
+            'taskkill /F /IM MEmu.exe /IM MEmuHeadless.exe /IM MEmuSVC.exe >nul 2>&1',
+            'timeout /t 8 /nobreak >nul',
+            'if %ATTEMPT% LSS 3 goto TRYSTART',
+            'echo   FAILED 3 times. Send a photo of this window.',
+            'pause & exit',
+            ':BOOTED',
+            'echo   Android booted OK.',
+            'echo [4/4] Opening phone screen...',
+            'if exist "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat" (',
+            '  start "" "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"',
+            ') else if defined MEMUE (',
             '  start "" "%MEMUE%"',
             ') else (',
             '  echo   MEmu.exe not found! Check if MEmu installed correctly.',
             '  pause & exit',
             ')',
             'echo.',
-            'echo  MEmu is loading - wait for Android home screen (1-3 min).',
+            'echo  Android is booted. The phone window opens in a few seconds.',
             'echo  DO NOT close this window!',
             'echo.',
-            'echo  When Android is fully loaded:',
+            'echo  When you see the phone home screen:',
             'echo   1. Press any key here',
             'echo   2. Then run:  2 - SETUP SPOOF.bat',
             'echo.',
@@ -468,6 +556,48 @@ jobs:
           [System.IO.File]::WriteAllText(
             "$desk\\1 - START SAMSUNG PHONE.bat", $f1,
             [System.Text.Encoding]::ASCII)
+
+          # FILE 1b — phone screen via scrcpy (software render, works without GPU)
+          New-Item -ItemType Directory -Force C:\PhoneTools | Out-Null
+          $scExe  = Get-ChildItem C:\PhoneTools\scrcpy -Filter scrcpy.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $scPath = if ($scExe) { $scExe.FullName } else { "" }
+          $fv = @(
+            '@echo off',
+            'title Phone Screen (scrcpy)',
+            "set `"ADB=$adbPath`"",
+            "set `"SCRCPY=$scPath`"",
+            "set `"MEMUE=$memuPath`"",
+            "set PORT=$adbPort",
+            'if "%SCRCPY%"=="" goto NOSC',
+            'if not exist "%SCRCPY%" goto NOSC',
+            'echo Connecting to Android...',
+            '"%ADB%" connect 127.0.0.1:%PORT%',
+            '"%SCRCPY%" -s 127.0.0.1:%PORT% --render-driver=software --max-size=1024 --max-fps=30 --video-bit-rate=4M --no-audio --window-title="Samsung S23 FE"',
+            'if errorlevel 1 (',
+            '  echo.',
+            '  echo   scrcpy closed with an error. Is Android booted? Run 1 - START first.',
+            '  pause',
+            ')',
+            'exit',
+            ':NOSC',
+            'echo scrcpy is not installed - opening the MEmu window instead.',
+            'start "" "%MEMUE%"',
+            'pause'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText("C:\PhoneTools\1b - OPEN PHONE SCREEN.bat", $fv, [System.Text.Encoding]::ASCII)
+
+          # Backup: MEmu's own window with software OpenGL (Mesa) copied next to MEmu.exe
+          $fb = @(
+            '@echo off',
+            'title MEmu Play 9 - backup window (Mesa OpenGL)',
+            "set `"MEMUE=$memuPath`"",
+            "set `"MROOT=$memuRoot`"",
+            'for %%f in (opengl32.dll libgallium_wgl.dll libglapi.dll) do if exist "C:\PhoneTools\MesaGL\%%f" copy /y "C:\PhoneTools\MesaGL\%%f" "%MROOT%\" >nul',
+            'start "" "%MEMUE%"',
+            'echo MEmu window launched with software OpenGL. Android must already be running (use 1 - START first).',
+            'timeout /t 5 /nobreak >nul'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText("C:\PhoneTools\MEmu Play 9 (backup window).bat", $fb, [System.Text.Encoding]::ASCII)
 
           # FILE 2 — 2 - SETUP SPOOF.bat
           # Strategy:
@@ -617,10 +747,26 @@ jobs:
             "$desk\3 - GUIDE (READ FIRST).txt", $f3,
             [System.Text.Encoding]::UTF8)
 
+          # Copy everything to C:\PhoneTools too, and put real shortcuts on the Desktop
+          Copy-Item "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"      "$desk\" -Force
+          Copy-Item "C:\PhoneTools\MEmu Play 9 (backup window).bat" "$desk\" -Force
+          Copy-Item "$desk\1 - START SAMSUNG PHONE.bat" C:\PhoneTools\ -Force
+          Copy-Item "$desk\2 - SETUP SPOOF.bat"         C:\PhoneTools\ -Force
+          try {
+            $ws = New-Object -ComObject WScript.Shell
+            $s = $ws.CreateShortcut("$desk\MEmu Play 9.lnk")
+            $s.TargetPath = $memuPath; $s.WorkingDirectory = (Split-Path $memuPath); $s.Save()
+            $s = $ws.CreateShortcut("$desk\Phone Screen.lnk")
+            $s.TargetPath = "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"; $s.WorkingDirectory = "C:\PhoneTools"
+            $s.IconLocation = "$memuPath,0"; $s.Save()
+            Write-Host "Shortcuts created." -ForegroundColor Green
+          } catch { Write-Host "Shortcut creation failed: $_" -ForegroundColor Yellow }
+
           Write-Host "Desktop toolkit created." -ForegroundColor Green
           Write-Host "  1 - START SAMSUNG PHONE.bat" -ForegroundColor Yellow
           Write-Host "  2 - SETUP SPOOF.bat"         -ForegroundColor Yellow
           Write-Host "  3 - GUIDE (READ FIRST).txt"  -ForegroundColor Yellow
+          Write-Host "  1b - OPEN PHONE SCREEN.bat / Phone Screen.lnk / MEmu Play 9.lnk / backup window" -ForegroundColor Yellow
 
       # ══════════════════════════════════════════════
       #  6. Keep server alive (6 hours)

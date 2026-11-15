@@ -112,12 +112,24 @@ jobs:
           )
           Write-Host "  Downloading 729 MB — progress bar below (1-40 min):" -ForegroundColor Gray
           Write-Host "  DO NOT cancel during download or install." -ForegroundColor Yellow
-          & curl.exe -L -f --retry 4 --retry-delay 5 --retry-connrefused `
-            --max-time 600 --connect-timeout 30 -C - --progress-bar `
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" `
-            -H "Referer: https://www.memuplay.com/" `
-            -H "Accept: application/octet-stream,*/*" `
-            -o $memuInst "https://dl.memuplay.com/download/Memu-Setup.exe"
+          $memuUrl = "https://dl.memuplay.com/download/Memu-Setup.exe"
+          for ($try = 1; $try -le 15; $try++) {
+            # FIX: curl exit 18 (connection cut mid-download) is NOT retried by --retry alone.
+            # --retry-all-errors + an outer loop + resume (-C -) keeps going from where it stopped.
+            & curl.exe -L -f --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused `
+              --connect-timeout 30 --speed-time 60 --speed-limit 1000 -C - --progress-bar `
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" `
+              -H "Referer: https://www.memuplay.com/" `
+              -H "Accept: application/octet-stream,*/*" `
+              -o $memuInst $memuUrl
+            $code = $LASTEXITCODE
+            $cur  = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
+            Write-Host ("  curl exit={0} size={1} MB (try {2}/15)" -f $code, [math]::Round($cur/1MB,1), $try)
+            if ($code -eq 0 -and $cur -gt 100MB) { break }
+            if ($code -eq 22 -and $cur -gt 700MB) { break }   # 416 = file already complete
+            if ($code -eq 33 -or $code -eq 36) { Remove-Item $memuInst -Force -ErrorAction SilentlyContinue }
+            Start-Sleep 10
+          }
           $sz = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
           if ($sz -gt 100MB) {
             Write-Host ">>> Download OK: $([math]::Round($sz/1MB,1)) MB" -ForegroundColor Green
@@ -146,9 +158,10 @@ jobs:
             try {
               winget source update --disable-interactivity 2>&1 | Out-Null
               foreach ($id in @("Microvirt.MEmuAndroid","Microvirt.MEmu","MEmu.MEmu")) {
-                $r = winget install --id $id --silent --accept-package-agreements `
-                     --accept-source-agreements --disable-interactivity 2>&1
-                Start-Sleep 15
+                $job = Start-Job -ScriptBlock { param($i) winget install --id $i --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 } -ArgumentList $id
+                if (-not (Wait-Job $job -Timeout 240)) { Write-Host "winget $id timed out - skipping" -ForegroundColor Yellow; Stop-Job $job }
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
+                Start-Sleep 5
                 $f = Find-Exe "MEmu.exe"
                 if ($f) {
                   Write-Host "winget OK ($id): $($f.FullName)" -ForegroundColor Green
@@ -690,22 +703,14 @@ jobs:
             'echo.',
             'echo [6/8] Downloading TextNow APK (free US phone number)...',
             'del /Q "C:\textnow.apk" 2>nul',
-            'curl.exe -L -f --retry 3 --retry-delay 5 --max-time 90',
-            '  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"',
-            '  -o "C:\textnow.apk"',
-            '  "https://apkpure.net/textnow-free-texting-calling-app/com.enflick.android.TextNow/download"',
-            '  2>nul',
+            'curl.exe -L -f --retry 3 --retry-delay 5 --max-time 90 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" -o "C:\textnow.apk" "https://apkpure.net/textnow-free-texting-calling-app/com.enflick.android.TextNow/download" 2>nul',
             'if not exist "C:\textnow.apk" goto :tn2',
             'for %%A in ("C:\textnow.apk") do if %%~zA lss 1000000 goto :tn2',
             'goto :tn_install',
             ':tn2',
             'echo   First URL failed, trying mirror...',
             'del /Q "C:\textnow.apk" 2>nul',
-            'curl.exe -L -f --retry 3 --retry-delay 5 --max-time 90',
-            '  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"',
-            '  -o "C:\textnow.apk"',
-            '  "https://d.apkpure.net/b/APK/com.enflick.android.TextNow?nc=arm64-v8a&sr=high"',
-            '  2>nul',
+            'curl.exe -L -f --retry 3 --retry-delay 5 --max-time 90 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" -o "C:\textnow.apk" "https://d.apkpure.net/b/APK/com.enflick.android.TextNow?nc=arm64-v8a&sr=high" 2>nul',
             'if not exist "C:\textnow.apk" goto :tn_manual',
             'for %%A in ("C:\textnow.apk") do if %%~zA lss 1000000 goto :tn_manual',
             ':tn_install',
@@ -714,7 +719,7 @@ jobs:
             'goto :tn_done',
             ':tn_manual',
             'echo   Auto-download failed.',
-            'echo   >> Install TextNow manually: Play Store inside MEmu > search TextNow',
+            'echo   Install TextNow manually: Play Store inside MEmu, search TextNow',
             ':tn_done',
             'timeout /t 2 /nobreak >nul',
             'echo.',
@@ -728,6 +733,7 @@ jobs:
             'echo.',
             'echo [8/8] REBOOTING VM to apply Samsung identity...',
             'echo   (gsm.* setprop will reset - re-run step 2 manually after reboot if needed)',
+            'taskkill /F /IM scrcpy.exe >nul 2>&1',
             '"%MEMUC%" stop -i 0',
             'timeout /t 10 /nobreak >nul',
             '"%MEMUC%" start -i 0',
@@ -746,6 +752,7 @@ jobs:
             '%ADB% shell setprop gsm.operator.numeric 310260 2>nul',
             '%ADB% shell setprop gsm.operator.iso-country us 2>nul',
             'echo   SIM re-applied.',
+            'if exist "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat" start "" "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"',
             'echo.',
             'echo  =====================================================',
             'echo   SETUP COMPLETE - Now create Gmail:',
@@ -757,8 +764,8 @@ jobs:
             'echo   4. Settings > Accounts > Add Account > Google',
             'echo.',
             'echo   5. ON CARRIER VERIFY SCREEN:',
-            'echo      -> Scroll DOWN -> Click SKIP (bottom-left)',
-            'echo      -> DO NOT click Next/Get Code',
+            'echo      Scroll DOWN then click SKIP at bottom-left',
+            'echo      DO NOT click Next or Get Code',
             'echo.',
             'echo   6. Enter TextNow number manually',
             'echo   7. Get SMS code from TextNow app',

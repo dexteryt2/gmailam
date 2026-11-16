@@ -44,6 +44,7 @@ jobs:
         shell: pwsh
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_EXIT_NODE: ${{ secrets.TAILSCALE_EXIT_NODE }}
         run: |
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
             -OutFile "C:\ts.msi" -UseBasicParsing
@@ -53,11 +54,38 @@ jobs:
             --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp"
           Start-Sleep 8
           $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          Write-Host "======================================"
-          Write-Host "  Tailscale IP : $ip"
-          Write-Host "  Username     : NexAdmin"
-          Write-Host "  Password     : Nexouya2026RdpX7"
-          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "======================================" -ForegroundColor Green
+          Write-Host "  Tailscale IP : $ip" -ForegroundColor Yellow
+          Write-Host "  Username     : NexAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Nexouya2026RdpX7" -ForegroundColor Yellow
+          Write-Host "======================================" -ForegroundColor Green
+
+          # ── Exit node: route ALL traffic through user's home PC ───────────
+          # Set secret TAILSCALE_EXIT_NODE = your home PC's Tailscale IP (100.x.x.x)
+          # On home PC: Tailscale > Settings > "Use as exit node" = ON
+          # This gives MEmu a residential IP and allows Gmail creation.
+          $exitNode = $Env:TAILSCALE_EXIT_NODE
+          if ($exitNode -and $exitNode.Trim() -ne "") {
+            Write-Host ""
+            Write-Host ">>> Exit node configured: $exitNode" -ForegroundColor Cyan
+            & "C:\Program Files\Tailscale\tailscale.exe" set `
+              --exit-node="$($exitNode.Trim())" `
+              --exit-node-allow-lan-access
+            Start-Sleep 5
+            try {
+              $pubip = (Invoke-WebRequest "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Content.Trim()
+              Write-Host ">>> Public IP via exit node: $pubip" -ForegroundColor Green
+              Write-Host ">>> All traffic (including MEmu) now routes through your HOME IP!" -ForegroundColor Green
+            } catch {
+              Write-Host ">>> Could not verify public IP: $_" -ForegroundColor Yellow
+            }
+          } else {
+            Write-Host ""
+            Write-Host ">>> No exit node set. IMPORTANT: Gmail creation may fail!" -ForegroundColor Red
+            Write-Host "    To fix: Add secret TAILSCALE_EXIT_NODE = your home Tailscale IP" -ForegroundColor Yellow
+            Write-Host "    On your home PC: Tailscale > Settings > Use as exit node = ON" -ForegroundColor Yellow
+          }
 
       # ══════════════════════════════════════════════
       #  4. Install MEmu Play
@@ -674,12 +702,24 @@ jobs:
             '%ADB% shell getprop gsm.operator.alpha',
             'timeout /t 2 /nobreak >nul',
             'echo.',
-            'echo [3/8] Samsung S23 FE identity via memuc setconfigex...',
-            '"%MEMUC%" setconfigex -i 0 manufacturer samsung',
-            '"%MEMUC%" setconfigex -i 0 model SM-S711B',
-            '"%MEMUC%" setconfigex -i 0 brand samsung',
-            '"%MEMUC%" setconfigex -i 0 imei 358240055329871',
-            'echo   Identity config saved. Will take effect after reboot.',
+            'echo [3/8] Samsung S23 FE identity — 3 methods for maximum coverage...',
+            'echo   Method A: memuc setconfigex (config file, persists on restart)',
+            '"%MEMUC%" setconfigex -i 0 manufacturer samsung 2>nul',
+            '"%MEMUC%" setconfigex -i 0 model SM-S711B 2>nul',
+            '"%MEMUC%" setconfigex -i 0 brand samsung 2>nul',
+            '"%MEMUC%" setconfigex -i 0 imei 358240055329871 2>nul',
+            '"%MEMUC%" setconfigex -i 0 property:ro.product.manufacturer=samsung 2>nul',
+            '"%MEMUC%" setconfigex -i 0 property:ro.product.model=SM-S711B 2>nul',
+            '"%MEMUC%" setconfigex -i 0 property:ro.product.brand=samsung 2>nul',
+            'echo   Method B: /data/local.prop (processed by Android init on boot)',
+            '%ADB% shell "printf ''ro.product.manufacturer=samsung\nro.product.model=SM-S711B\nro.product.brand=samsung\nro.product.device=s5e9925\nro.product.name=SM-S711B\nro.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys\n'' > /data/local.prop"',
+            '%ADB% shell chmod 644 /data/local.prop',
+            '%ADB% shell cat /data/local.prop',
+            'echo   Method C: persist.* properties (survive reboot)',
+            '%ADB% shell setprop persist.sys.timezone America/New_York',
+            '%ADB% shell settings put global time_zone America/New_York',
+            '%ADB% shell setprop persist.gsm.operator.iso-country us',
+            'echo   All methods applied. Rebooting will activate /data/local.prop.',
             'timeout /t 2 /nobreak >nul',
             'echo.',
             'echo [4/8] Clearing Google Play Services cache...',
@@ -809,8 +849,14 @@ jobs:
             'echo.',
             'echo  =====================================================',
             'echo   GMAIL CREATION - BROWSER METHOD',
-            'echo   This bypasses the carrier SIM check!',
             'echo  =====================================================',
+            'echo.',
+            'echo [0/3] Checking public IP (must be residential)...',
+            'powershell -Command "try{$ip=(Invoke-WebRequest https://api.ipify.org -UseBasicParsing -TimeoutSec 8).Content.Trim();Write-Host IP: $ip}catch{Write-Host Could not check IP}"',
+            'echo.',
+            'echo   IMPORTANT: If IP shows Azure datacenter address,',
+            'echo   Gmail creation will FAIL. Set TAILSCALE_EXIT_NODE secret first.',
+            'echo   (See 3 - GUIDE for instructions)',
             'echo.',
             'echo [1/3] Reconnecting ADB...',
             '%ADB% connect 127.0.0.1:%PORT% >nul 2>&1',
@@ -839,19 +885,23 @@ jobs:
             'echo   - Password',
             'echo.',
             'echo   WHEN PHONE NUMBER IS ASKED:',
-            'echo   Option A (Free): Enter your TextNow number',
-            'echo     Open TextNow app and check your US number',
-            'echo     Enter it here, for example +1 234 567 8901',
-            'echo     Get the code from TextNow Messages',
             'echo.',
-            'echo   Option B - most reliable, about 0.20 USD:',
-            'echo     On YOUR PC browser: go to 5sim.net',
-            'echo     Buy a Google/USA number, about 0.20 USD',
-            'echo     Enter that number here',
-            'echo     Get the code from the 5sim.net website',
+            'echo   BEST OPTION - esimplus.me (real eSIM numbers, free tier):',
+            'echo     1. On your PC: go to esimplus.me/temporary-numbers',
+            'echo     2. Choose United States',
+            'echo     3. Get a temporary number (no app needed)',
+            'echo     4. Enter that number in the Google form',
+            'echo     5. Check esimplus.me for the SMS code',
             'echo.',
-            'echo   Option C (Try skip): look for SKIP link',
-            'echo     Some accounts can skip phone verification',
+            'echo   OPTION B - 5sim.net (~$0.20, most reliable):',
+            'echo     1. On your PC: go to 5sim.net',
+            'echo     2. Buy a Google/USA number',
+            'echo     3. Enter it here, check code on 5sim.net',
+            'echo.',
+            'echo   OPTION C - TextNow (free but needs Play Store first):',
+            'echo     If TextNow is installed: check number in app',
+            'echo.',
+            'echo   Try SKIP if visible (some accounts skip phone)',
             'echo.',
             'echo   IMPORTANT: Use this Chrome browser method',
             'echo   NOT Settings, Add Account',
@@ -883,6 +933,27 @@ jobs:
             '  Web flow does NOT do carrier-level check',
             '  Only asks for SMS code on a number you provide',
             '  TextNow or 5sim.net works here',
+            '',
+            '================================================',
+            '',
+            'STEP 0 - CRITICAL: Set up residential IP FIRST',
+            '  Without this step, Gmail creation will fail on Azure IP.',
+            '',
+            '  On your HOME PC (one-time setup):',
+            '  a) Open Tailscale on your PC',
+            '  b) Click your username > Settings',
+            '  c) Enable: "Use as exit node" (or Advertise as exit node)',
+            '  d) Find your Tailscale IP: run tailscale ip -4 in terminal',
+            '     (looks like 100.x.x.x)',
+            '',
+            '  On GitHub (one-time setup):',
+            '  a) Your repo > Settings > Secrets and variables > Actions',
+            '  b) New repository secret:',
+            '     Name  : TAILSCALE_EXIT_NODE',
+            '     Value : your Tailscale IP (100.x.x.x)',
+            '',
+            '  Result: ALL traffic from the server routes through your',
+            '  home internet connection (residential IP). Google accepts it.',
             '',
             '================================================',
             '',
@@ -937,11 +1008,16 @@ jobs:
             '',
             '================================================',
             '',
-            'IF TextNow number is REJECTED by Google:',
-            '  Option 1: Wait 24 hours and try a different TextNow number',
-            '  Option 2: Use 5sim.net (paid ~$0.20 per number)',
-            '             Real carrier numbers, 95% success rate',
-            '             Website: https://5sim.net',
+            'PHONE NUMBER OPTIONS (best to worst):',
+            '  1. esimplus.me/temporary-numbers (BEST - real eSIM, free tier)',
+            '     Real eSIM numbers, not VoIP, Google accepts them',
+            '     Web-based - no app needed in MEmu',
+            '',
+            '  2. 5sim.net (~$0.20 per number)',
+            '     Real carrier numbers, 95% success rate',
+            '',
+            '  3. TextNow (free but needs Play Store / Google account first)',
+            '     Circular dependency - hard to install without Google',
             '',
             'Device identity after SETUP:',
             '  Model   : Samsung Galaxy S23 FE (SM-S711B)',

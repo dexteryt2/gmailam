@@ -68,23 +68,38 @@ jobs:
           $exitNode = $Env:TAILSCALE_EXIT_NODE
           if ($exitNode -and $exitNode.Trim() -ne "") {
             Write-Host ""
-            Write-Host ">>> Exit node configured: $exitNode" -ForegroundColor Cyan
-            & "C:\Program Files\Tailscale\tailscale.exe" set `
+            Write-Host ">>> Trying exit node: $exitNode" -ForegroundColor Cyan
+            # NOTE: Exit node must be APPROVED in Tailscale admin console first.
+            # https://login.tailscale.com/admin/machines → desktop-dexter → ... → Edit route settings → Use as exit node ✓
+            $tsOut = & "C:\Program Files\Tailscale\tailscale.exe" set `
               --exit-node="$($exitNode.Trim())" `
-              --exit-node-allow-lan-access
-            Start-Sleep 5
-            try {
-              $pubip = (Invoke-WebRequest "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Content.Trim()
-              Write-Host ">>> Public IP via exit node: $pubip" -ForegroundColor Green
-              Write-Host ">>> All traffic (including MEmu) now routes through your HOME IP!" -ForegroundColor Green
-            } catch {
-              Write-Host ">>> Could not verify public IP: $_" -ForegroundColor Yellow
+              --exit-node-allow-lan-access 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host ">>> Exit node error: $tsOut" -ForegroundColor Red
+              Write-Host "    FIX: Go to https://login.tailscale.com/admin/machines" -ForegroundColor Yellow
+              Write-Host "    Find desktop-dexter → ... → Edit route settings → check 'Use as exit node' → Save" -ForegroundColor Yellow
+              Write-Host "    Then re-run the workflow." -ForegroundColor Yellow
+              Write-Host ">>> Continuing WITHOUT exit node (Gmail creation may fail on this IP)" -ForegroundColor Yellow
+            } else {
+              Start-Sleep 5
+              try {
+                $pubip = (Invoke-WebRequest "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Content.Trim()
+                Write-Host ">>> Public IP via exit node: $pubip" -ForegroundColor Green
+                if ($pubip -match '^20\.|^52\.|^40\.|^104\.|^13\.') {
+                  Write-Host "    WARNING: IP still looks like Azure datacenter!" -ForegroundColor Red
+                  Write-Host "    Exit node may not be active yet. Check Tailscale admin." -ForegroundColor Yellow
+                } else {
+                  Write-Host ">>> HOME IP confirmed! All traffic routes through your residential IP." -ForegroundColor Green
+                }
+              } catch {
+                Write-Host ">>> Could not verify public IP: $_" -ForegroundColor Yellow
+              }
             }
           } else {
             Write-Host ""
-            Write-Host ">>> No exit node set. IMPORTANT: Gmail creation may fail!" -ForegroundColor Red
-            Write-Host "    To fix: Add secret TAILSCALE_EXIT_NODE = your home Tailscale IP" -ForegroundColor Yellow
-            Write-Host "    On your home PC: Tailscale > Settings > Use as exit node = ON" -ForegroundColor Yellow
+            Write-Host ">>> No TAILSCALE_EXIT_NODE secret set." -ForegroundColor Yellow
+            Write-Host "    Gmail creation will likely fail on Azure IP." -ForegroundColor Yellow
+            Write-Host "    To fix: Add TAILSCALE_EXIT_NODE secret = your home Tailscale IP" -ForegroundColor Yellow
           }
 
       # ══════════════════════════════════════════════

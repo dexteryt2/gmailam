@@ -65,41 +65,14 @@ jobs:
           # Set secret TAILSCALE_EXIT_NODE = your home PC's Tailscale IP (100.x.x.x)
           # On home PC: Tailscale > Settings > "Use as exit node" = ON
           # This gives MEmu a residential IP and allows Gmail creation.
+          # Exit node is activated AFTER installation (step 5 end).
+          # Activating here would route ALL downloads through Iran — blocking MEmu/Nox CDNs.
           $exitNode = $Env:TAILSCALE_EXIT_NODE
           if ($exitNode -and $exitNode.Trim() -ne "") {
-            Write-Host ""
-            Write-Host ">>> Trying exit node: $exitNode" -ForegroundColor Cyan
-            # NOTE: Exit node must be APPROVED in Tailscale admin console first.
-            # https://login.tailscale.com/admin/machines → desktop-dexter → ... → Edit route settings → Use as exit node ✓
-            $tsOut = & "C:\Program Files\Tailscale\tailscale.exe" set `
-              --exit-node="$($exitNode.Trim())" `
-              --exit-node-allow-lan-access 2>&1
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host ">>> Exit node error: $tsOut" -ForegroundColor Red
-              Write-Host "    FIX: Go to https://login.tailscale.com/admin/machines" -ForegroundColor Yellow
-              Write-Host "    Find desktop-dexter → ... → Edit route settings → check 'Use as exit node' → Save" -ForegroundColor Yellow
-              Write-Host "    Then re-run the workflow." -ForegroundColor Yellow
-              Write-Host ">>> Continuing WITHOUT exit node (Gmail creation may fail on this IP)" -ForegroundColor Yellow
-            } else {
-              Start-Sleep 5
-              try {
-                $pubip = (Invoke-WebRequest "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Content.Trim()
-                Write-Host ">>> Public IP via exit node: $pubip" -ForegroundColor Green
-                if ($pubip -match '^20\.|^52\.|^40\.|^104\.|^13\.') {
-                  Write-Host "    WARNING: IP still looks like Azure datacenter!" -ForegroundColor Red
-                  Write-Host "    Exit node may not be active yet. Check Tailscale admin." -ForegroundColor Yellow
-                } else {
-                  Write-Host ">>> HOME IP confirmed! All traffic routes through your residential IP." -ForegroundColor Green
-                }
-              } catch {
-                Write-Host ">>> Could not verify public IP: $_" -ForegroundColor Yellow
-              }
-            }
+            Write-Host ">>> Exit node $exitNode will be activated AFTER installation." -ForegroundColor Cyan
+            Write-Host "    (Downloads stay on Azure network; exit node activates for Gmail creation)" -ForegroundColor Gray
           } else {
-            Write-Host ""
-            Write-Host ">>> No TAILSCALE_EXIT_NODE secret set." -ForegroundColor Yellow
-            Write-Host "    Gmail creation will likely fail on Azure IP." -ForegroundColor Yellow
-            Write-Host "    To fix: Add TAILSCALE_EXIT_NODE secret = your home Tailscale IP" -ForegroundColor Yellow
+            Write-Host ">>> No TAILSCALE_EXIT_NODE set — Gmail creation may fail on Azure IP." -ForegroundColor Yellow
           }
 
       # ══════════════════════════════════════════════
@@ -178,12 +151,19 @@ jobs:
             Write-Host ">>> Download OK: $([math]::Round($sz/1MB,1)) MB" -ForegroundColor Green
             Write-Host ">>> INSTALLING MEmu now — 5-15 min of silence is NORMAL." -ForegroundColor Yellow
             Write-Host "    Watch the dots. DO NOT cancel." -ForegroundColor Yellow
-            $proc = Start-Process $memuInst -ArgumentList "/S" -PassThru
-            $t = 0
-            while (-not $proc.HasExited) {
-              Start-Sleep 15; $t += 15
-              Write-Host "    still installing... ${t}s" -ForegroundColor Gray
-              if ($t -gt 900) { Write-Host "Timeout — killing installer."; $proc.Kill(); break }
+            try {
+              $proc = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
+              if ($null -eq $proc) { throw "Start-Process returned null" }
+              $t = 0
+              while (-not $proc.HasExited) {
+                Start-Sleep 15; $t += 15
+                Write-Host "    still installing... ${t}s" -ForegroundColor Gray
+                if ($t -gt 900) { Write-Host "Timeout — killing installer."; $proc.Kill(); break }
+              }
+              Write-Host "    installer exit code: $($proc.ExitCode)" -ForegroundColor Gray
+            } catch {
+              Write-Host "    installer launch error: $_ — waiting 90s anyway" -ForegroundColor Yellow
+              Start-Sleep 90
             }
             Write-Host ("  installer exit code: {0}" -f $(try { $proc.ExitCode } catch { "n/a" }))
             # FIX: the installer parent process can exit while setup keeps working in a child process,
@@ -1062,6 +1042,38 @@ jobs:
           Write-Host "  1 - START SAMSUNG PHONE.bat" -ForegroundColor Yellow
           Write-Host "  2 - SETUP SPOOF.bat"         -ForegroundColor Yellow
           Write-Host "  3 - GUIDE (READ FIRST).txt"  -ForegroundColor Yellow
+
+          # ── Activate exit node NOW — all installations done ───────────────
+          # From this point, all traffic (including MEmu internet) routes
+          # through the user's home PC (residential IP). Gmail creation works.
+          $exitNode = $Env:TAILSCALE_EXIT_NODE
+          if ($exitNode -and $exitNode.Trim() -ne "") {
+            Write-Host ""
+            Write-Host ">>> Activating exit node: $exitNode" -ForegroundColor Cyan
+            $tsOut = & "C:\Program Files\Tailscale\tailscale.exe" set `
+              --exit-node="$($exitNode.Trim())" `
+              --exit-node-allow-lan-access 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host ">>> Exit node error: $tsOut" -ForegroundColor Red
+              Write-Host "    FIX: https://login.tailscale.com/admin/machines" -ForegroundColor Yellow
+              Write-Host "    desktop-dexter → ... → Edit route settings → 'Use as exit node' ✓ → Save" -ForegroundColor Yellow
+            } else {
+              Start-Sleep 5
+              try {
+                $pubip = (Invoke-WebRequest "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Content.Trim()
+                if ($pubip -match '^20\.|^52\.|^40\.|^104\.|^13\.') {
+                  Write-Host ">>> IP: $pubip (still Azure — exit node may not be approved yet)" -ForegroundColor Yellow
+                } else {
+                  Write-Host ">>> Exit node ACTIVE. Public IP: $pubip (residential ✓)" -ForegroundColor Green
+                  Write-Host ">>> MEmu internet will use YOUR home IP. Gmail creation will work." -ForegroundColor Green
+                }
+              } catch {
+                Write-Host ">>> Exit node set but could not verify IP: $_" -ForegroundColor Yellow
+              }
+            }
+          } else {
+            Write-Host ">>> No exit node — downloads complete, but Gmail may fail on Azure IP." -ForegroundColor Yellow
+          }
           Write-Host "  1b - OPEN PHONE SCREEN.bat / Phone Screen.lnk / MEmu Play 9.lnk / backup window" -ForegroundColor Yellow
 
       # ══════════════════════════════════════════════

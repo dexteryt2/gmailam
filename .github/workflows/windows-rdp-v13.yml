@@ -1,0 +1,1088 @@
+name: Windows Cloud RDP
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ══════════════════════════════════════════════
+      #  1. Enable Remote Desktop
+      # ══════════════════════════════════════════════
+      - name: 1. Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 0
+          Write-Host "RDP enabled."
+
+      # ══════════════════════════════════════════════
+      #  2. Create Admin Account
+      # ══════════════════════════════════════════════
+      - name: 2. Create Admin Account
+        shell: pwsh
+        run: |
+          $pw = ConvertTo-SecureString "Nexouya2026RdpX7" -AsPlainText -Force
+          New-LocalUser -Name "NexAdmin" -Password $pw `
+            -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" `
+            -Member "NexAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Nexouya2026RdpX7
+          Write-Host "Accounts ready."
+
+      # ══════════════════════════════════════════════
+      #  3. Tailscale VPN
+      # ══════════════════════════════════════════════
+      - name: 3. Install and Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_EXIT_NODE: ${{ secrets.TAILSCALE_EXIT_NODE }}
+        run: |
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "C:\ts.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i C:\ts.msi /quiet /norestart" -Wait
+          Start-Sleep 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp"
+          Start-Sleep 8
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host ""
+          Write-Host "======================================" -ForegroundColor Green
+          Write-Host "  Tailscale IP : $ip" -ForegroundColor Yellow
+          Write-Host "  Username     : NexAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Nexouya2026RdpX7" -ForegroundColor Yellow
+          Write-Host "======================================" -ForegroundColor Green
+
+          # ── Exit node: route ALL traffic through user's home PC ───────────
+          # Set secret TAILSCALE_EXIT_NODE = your home PC's Tailscale IP (100.x.x.x)
+          # On home PC: Tailscale > Settings > "Use as exit node" = ON
+          # This gives MEmu a residential IP and allows Gmail creation.
+          # Exit node is activated AFTER installation (step 5 end).
+          # Activating here would route ALL downloads through Iran — blocking MEmu/Nox CDNs.
+          $exitNode = $Env:TAILSCALE_EXIT_NODE
+          if ($exitNode -and $exitNode.Trim() -ne "") {
+            Write-Host ">>> Exit node $exitNode will be activated AFTER installation." -ForegroundColor Cyan
+            Write-Host "    (Downloads stay on Azure network; exit node activates for Gmail creation)" -ForegroundColor Gray
+          } else {
+            Write-Host ">>> No TAILSCALE_EXIT_NODE set — Gmail creation may fail on Azure IP." -ForegroundColor Yellow
+          }
+
+      # ══════════════════════════════════════════════
+      #  4. Install MEmu Play
+      #
+      #  WHY MEmu instead of LDPlayer:
+      #  - LDPlayer CDN (Alibaba OSS) returns NoSuchKey
+      #    for every filename we tried. The files do not
+      #    exist at those URLs — not a network block.
+      #  - winget installed something in 7.5 min but
+      #    dnplayer.exe was never found anywhere on C:      #  - MEmu has a stable public download URL that
+      #    works from Azure/GitHub Actions IPs.
+      #  - MEmu supports ADB root + build.prop spoof
+      #    — identical approach, same result.
+      # ══════════════════════════════════════════════
+      - name: 4. Install Android Emulator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference    = 'SilentlyContinue'
+          New-Item C:\debug -ItemType Directory -Force | Out-Null
+
+          # ── Helper: find exe after install ───────────────────────────────
+          function Find-Exe($name) {
+            foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+              $f = Get-ChildItem $d.Root -Filter $name -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+              if ($f) { return $f }
+            }
+            return $null
+          }
+
+          $installed = $false
+          $emulatorType = ""
+
+          # ════════════════════════════════════════════════════════
+          #  ATTEMPT 1 — MEmu via curl.exe
+          #  curl handles CDN redirects faster than BITS/IWR and
+          #  supports resume (-C -) which BITS cannot do.
+          # ════════════════════════════════════════════════════════
+          Write-Host ">>> [1] Trying MEmu via curl.exe..." -ForegroundColor Cyan
+          $memuInst = "C:\memu_setup.exe"
+          Remove-Item $memuInst -Force -ErrorAction SilentlyContinue
+          $curlArgs = @(
+            "-L", "-f", "--retry", "4", "--retry-delay", "5", "--retry-connrefused",
+            "--max-time", "480", "--connect-timeout", "30",
+            "-C", "-",
+            "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
+            "-H", "Referer: https://www.memuplay.com/",
+            "-H", "Accept: application/octet-stream,*/*",
+            "-o", $memuInst,
+            "https://dl.memuplay.com/download/Memu-Setup.exe"
+          )
+          Write-Host "  Downloading 729 MB — progress bar below (1-40 min):" -ForegroundColor Gray
+          Write-Host "  DO NOT cancel during download or install." -ForegroundColor Yellow
+          $memuUrl = "https://dl.memuplay.com/download/Memu-Setup.exe"
+          for ($try = 1; $try -le 15; $try++) {
+            # FIX: curl exit 18 (connection cut mid-download) is NOT retried by --retry alone.
+            # --retry-all-errors + an outer loop + resume (-C -) keeps going from where it stopped.
+            & curl.exe -L -f --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused `
+              --connect-timeout 30 --speed-time 60 --speed-limit 1000 -C - --progress-bar `
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" `
+              -H "Referer: https://www.memuplay.com/" `
+              -H "Accept: application/octet-stream,*/*" `
+              -o $memuInst $memuUrl
+            $code = $LASTEXITCODE
+            $cur  = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
+            Write-Host ("  curl exit={0} size={1} MB (try {2}/15)" -f $code, [math]::Round($cur/1MB,1), $try)
+            if ($code -eq 0 -and $cur -gt 100MB) { break }
+            if ($code -eq 22 -and $cur -gt 700MB) { break }   # 416 = file already complete
+            if ($code -eq 33 -or $code -eq 36) { Remove-Item $memuInst -Force -ErrorAction SilentlyContinue }
+            Start-Sleep 10
+          }
+          $sz = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
+          if ($sz -gt 100MB) {
+            Write-Host ">>> Download OK: $([math]::Round($sz/1MB,1)) MB" -ForegroundColor Green
+            Write-Host ">>> INSTALLING MEmu now — 5-15 min of silence is NORMAL." -ForegroundColor Yellow
+            Write-Host "    Watch the dots. DO NOT cancel." -ForegroundColor Yellow
+            try {
+              $proc = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
+              if ($null -eq $proc) { throw "Start-Process returned null" }
+              $t = 0
+              while (-not $proc.HasExited) {
+                Start-Sleep 15; $t += 15
+                Write-Host "    still installing... ${t}s" -ForegroundColor Gray
+                if ($t -gt 900) { Write-Host "Timeout — killing installer."; $proc.Kill(); break }
+              }
+              Write-Host "    installer exit code: $($proc.ExitCode)" -ForegroundColor Gray
+            } catch {
+              Write-Host "    installer launch error: $_ — waiting 90s anyway" -ForegroundColor Yellow
+              Start-Sleep 90
+            }
+            Write-Host ("  installer exit code: {0}" -f $(try { $proc.ExitCode } catch { "n/a" }))
+            # FIX: the installer parent process can exit while setup keeps working in a child process,
+            # so poll for MEmu.exe (known folders first) instead of one search after 10 seconds.
+            $f = $null; $idle = 0
+            for ($w = 0; $w -lt 40 -and -not $f; $w++) {
+              foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+                foreach ($sub in "Program Files\Microvirt\MEmu","Program Files (x86)\Microvirt\MEmu","Microvirt\MEmu","MEmu") {
+                  $pp = Join-Path $d.Root "$sub\MEmu.exe"
+                  if (Test-Path $pp) { $f = Get-Item $pp; break }
+                }
+                if ($f) { break }
+              }
+              if ($f) { break }
+              $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'memu|microvirt|msiexec|setup' -and $_.Name -notmatch 'tailscale' })
+              if ($busy.Count -eq 0) { $idle++ } else { $idle = 0 }
+              Write-Host ("    waiting for MEmu files... {0}s (setup processes: {1})" -f ($w*15), (($busy | ForEach-Object { $_.Name }) -join ','))
+              if ($idle -ge 6) { break }   # nothing is installing any more
+              Start-Sleep 15
+            }
+            if (-not $f) { $f = Find-Exe "MEmu.exe" }
+            if ($f) {
+              Write-Host ">>> MEmu INSTALLED: $($f.FullName)" -ForegroundColor Green
+              $installed=$true; $emulatorType="memu"
+            } else { Write-Host "MEmu.exe not found after install." -ForegroundColor Yellow }
+          } else { Write-Host "curl failed ($sz bytes) — moving on." -ForegroundColor Yellow }
+
+          # ════════════════════════════════════════════════════════
+          #  ATTEMPT 2 — MEmu via winget
+          # ════════════════════════════════════════════════════════
+          if (-not $installed) {
+            Write-Host ">>> [2] Trying MEmu via winget..." -ForegroundColor Cyan
+            try {
+              winget source update --disable-interactivity 2>&1 | Out-Null
+              foreach ($id in @("Microvirt.MEmuAndroid","Microvirt.MEmu","MEmu.MEmu")) {
+                $job = Start-Job -ScriptBlock { param($i) winget install --id $i --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 } -ArgumentList $id
+                if (-not (Wait-Job $job -Timeout 240)) { Write-Host "winget $id timed out - skipping" -ForegroundColor Yellow; Stop-Job $job }
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
+                Start-Sleep 5
+                $f = Find-Exe "MEmu.exe"
+                if ($f) {
+                  Write-Host "winget OK ($id): $($f.FullName)" -ForegroundColor Green
+                  $installed=$true; $emulatorType="memu"; break
+                }
+              }
+            } catch { Write-Host "winget failed: $_" -ForegroundColor Yellow }
+          }
+
+          # ════════════════════════════════════════════════════════
+          #  ATTEMPT 3 — NoxPlayer (bignox.com CDN — different from MEmu)
+          #  NoxPlayer uses its own Hyper-V-compatible hypervisor.
+          # ════════════════════════════════════════════════════════
+          if (-not $installed) {
+            Write-Host ">>> [3] MEmu CDN unreachable from this region. Trying NoxPlayer..." -ForegroundColor Yellow
+            $noxInst = "C:\nox_setup.exe"
+            $noxUrls = @(
+              "https://res-download-hw.bignox.com/full/NoxPlayer_installer.exe",
+              "https://res.bignox.com/full/NoxPlayer_installer.exe"
+            )
+            foreach ($url in $noxUrls) {
+              Write-Host "  Downloading NoxPlayer from: $url" -ForegroundColor Cyan
+              Remove-Item $noxInst -Force -ErrorAction SilentlyContinue
+              Write-Host "  Progress bar:" -ForegroundColor Gray
+              & curl.exe -L -f --retry 3 --retry-delay 5 --max-time 600 `
+                --progress-bar `
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" `
+                -H "Referer: https://www.bignox.com/" `
+                -o $noxInst $url
+              $sz = (Get-Item $noxInst -ErrorAction SilentlyContinue).Length
+              if ($sz -gt 100MB) {
+                Write-Host ">>> Download OK: $([math]::Round($sz/1MB,1)) MB" -ForegroundColor Green
+                Write-Host ">>> INSTALLING NoxPlayer — 5-15 min silence is NORMAL." -ForegroundColor Yellow
+                $proc2 = Start-Process $noxInst -ArgumentList "/S" -PassThru
+                $t2 = 0
+                while (-not $proc2.HasExited) {
+                  Start-Sleep 15; $t2 += 15
+                  Write-Host "    installing NoxPlayer... ${t2}s" -ForegroundColor Gray
+                  if ($t2 -gt 900) { $proc2.Kill(); break }
+                }
+                Start-Sleep 15
+                $f = Find-Exe "Nox.exe"
+                if ($f) {
+                  Write-Host ">>> NoxPlayer INSTALLED: $($f.FullName)" -ForegroundColor Green
+                  $installed=$true; $emulatorType="nox"; break
+                }
+              } else { Write-Host "  NoxPlayer partial ($sz bytes), trying next URL..." -ForegroundColor Yellow }
+            }
+          }
+
+          # ════════════════════════════════════════════════════════
+          #  Result
+          # ════════════════════════════════════════════════════════
+          if (-not $installed) {
+            Write-Host "##[error] No emulator could be installed."
+            exit 1
+          }
+          $emulatorType | Set-Content "C:\emulator_type.txt" -Encoding ASCII
+          Write-Host "Emulator ready: $emulatorType" -ForegroundColor Green
+
+
+      # ══════════════════════════════════════════════
+      #  4b. Virtualization diagnostics + MEmu boot test
+      #  (tells you EXACTLY whether Hyper-V / VT-x blocks MEmu)
+      # ══════════════════════════════════════════════
+      - name: 4b. Virtualization Diagnostics and MEmu Boot Test
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # Skip if NoxPlayer was installed instead of MEmu
+          if (Test-Path "C:\emulator_type.txt") {
+            $etype = (Get-Content "C:\emulator_type.txt" -Raw).Trim()
+            if ($etype -ne "memu") {
+              Write-Host "Emulator is '$etype' (not MEmu) — skipping MEmu boot test." -ForegroundColor Yellow
+              exit 0
+            }
+          }
+          New-Item C:\debug -ItemType Directory -Force | Out-Null
+          Start-Transcript -Path C:\debug\4b_boot_test.txt -Force | Out-Null
+
+          Write-Host "===== CPU / hypervisor =====" -ForegroundColor Cyan
+          Get-CimInstance Win32_ComputerSystem | Format-List Manufacturer, Model, HypervisorPresent | Out-String | Write-Host
+          Get-CimInstance Win32_Processor | Format-List Name, NumberOfCores, VirtualizationFirmwareEnabled, SecondLevelAddressTranslationExtensions | Out-String | Write-Host
+          Write-Host "bcdedit hypervisor setting:"
+          bcdedit /enum "{current}" | Select-String -Pattern "hypervisor" | ForEach-Object { Write-Host $_ }
+          Write-Host "Windows features:"
+          Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.FeatureName -match 'Hyper-V|HypervisorPlatform|VirtualMachinePlatform' -and $_.State -eq 'Enabled' } |
+            Format-Table FeatureName, State -AutoSize | Out-String | Write-Host
+          Write-Host "Hyper-V services:"
+          Get-Service vmms, hvhost, vmcompute -ErrorAction SilentlyContinue | Format-Table Name, Status -AutoSize | Out-String | Write-Host
+
+          # ---- locate MEmu ----
+          $memuExe = $null
+          foreach ($d in (Get-PSDrive -PSProvider FileSystem)) {
+            foreach ($sub in "Program Files\Microvirt","Program Files (x86)\Microvirt","Microvirt","MEmu") {
+              $r = Join-Path $d.Root $sub
+              if (-not $memuExe -and (Test-Path $r)) {
+                $memuExe = Get-ChildItem $r -Filter "MEmu.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              }
+            }
+          }
+          if (-not $memuExe) { Write-Host "##[error] MEmu.exe not found"; Stop-Transcript | Out-Null; exit 1 }
+          $root   = $memuExe.DirectoryName
+          $memuc  = Join-Path $root "memuc.exe"
+          $manage = Join-Path $root "MEmuManage.exe"
+          $adb    = (Get-ChildItem $root -Filter adb.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          Write-Host "MEmu root: $root"
+          Write-Host "memuc: $(Test-Path $memuc)  manage: $(Test-Path $manage)  adb: $adb"
+
+          Write-Host "===== VM list =====" -ForegroundColor Cyan
+          if (Test-Path $memuc)  { & $memuc listvms 2>&1 | ForEach-Object { Write-Host $_ } }
+          if (Test-Path $manage) { & $manage list vms 2>&1 | ForEach-Object { Write-Host $_ } }
+
+          # NOTE from the first real run: MEmu uses WinHvPlatform (it supports Hyper-V),
+          # so Hyper-V is NOT the blocker. The VM crashed inside libOpenglRender.dll
+          # (OpenGL renderer; the runner has no GPU). So we retry with DirectX rendering.
+          function Test-Boot($label, $maxSec) {
+            Write-Host "===== Boot test: $label (max $maxSec s) =====" -ForegroundColor Cyan
+            & $memuc stop -i 0 2>&1 | Out-Null
+            Start-Sleep 8
+            $sp = Start-Process $memuc -ArgumentList "start -i 0" -PassThru -WindowStyle Hidden
+            $sp | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
+            for ($i = 1; $i -le [int]($maxSec / 15); $i++) {
+              Start-Sleep 15
+              & $adb connect 127.0.0.1:21503 2>&1 | Out-Null
+              $bc  = (& $adb -s 127.0.0.1:21503 shell getprop sys.boot_completed 2>&1 | Out-String).Trim()
+              $run = (& $memuc isvmrunning -i 0 2>&1 | Out-String).Trim()
+              Write-Host "[$($i*15)s] vm_running='$run' boot_completed='$bc'"
+              if ($bc -eq "1") { return $true }
+              if ($i -ge 3 -and $run -match '(?i)not running') { Write-Host "VM process died early."; return $false }
+            }
+            return $false
+          }
+
+          $booted = $false
+          if (-not (Test-Path $memuc)) { Write-Host "##[error] memuc.exe missing"; Stop-Transcript | Out-Null; exit 1 }
+
+          # CONFIRMED by real run: OpenGL render mode hangs/crashes on the runner (no GPU),
+          # DirectX (graphics_render_mode=1) boots in ~15 s. So set DirectX FIRST (persists in VM config).
+          & $memuc stop -i 0 2>&1 | Out-Null
+          Start-Sleep 5
+          & $memuc setconfigex -i 0 graphics_render_mode 1 2>&1 | ForEach-Object { Write-Host "setconfigex: $_" }
+          & $memuc getconfigex -i 0 graphics_render_mode   2>&1 | ForEach-Object { Write-Host "getconfigex: $_" }
+          $booted = Test-Boot "DirectX (graphics_render_mode=1)" 150
+
+          # Fallback only if that somehow failed: try the other key spelling
+          foreach ($key in "graphic_render_mode") {
+            if ($booted) { break }
+            Write-Host "--- setting $key = 1 (DirectX) ---" -ForegroundColor Yellow
+            & $memuc stop -i 0 2>&1 | Out-Null
+            Start-Sleep 5
+            & $memuc setconfigex -i 0 $key 1 2>&1 | ForEach-Object { Write-Host "setconfigex: $_" }
+            & $memuc setconfig   -i 0 $key 1 2>&1 | ForEach-Object { Write-Host "setconfig  : $_" }
+            & $memuc getconfigex -i 0 $key   2>&1 | ForEach-Object { Write-Host "getconfigex: $_" }
+            $booted = Test-Boot "DirectX via $key" 150
+          }
+
+          Write-Host "===== Result =====" -ForegroundColor Cyan
+          if ($booted) {
+            Write-Host "BOOT OK - MEmu runs on this runner." -ForegroundColor Green
+            & $adb -s 127.0.0.1:21503 shell getprop ro.product.model 2>&1 | ForEach-Object { Write-Host "Android model: $_" }
+          } else {
+            Write-Host "BOOT FAILED even with DirectX. See the crash summary below." -ForegroundColor Red
+            $logs = Get-ChildItem $root -Recurse -Include *.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+            foreach ($lg in $logs) {
+              Write-Host "##### $($lg.FullName)"
+              Write-Host "--- first exception / error lines ---"
+              Select-String -Path $lg.FullName -Pattern 'Xcpt|Exception|exception code|Fatal|VERR_|NEM|WHPX|Failed' -ErrorAction SilentlyContinue |
+                Select-Object -First 15 | ForEach-Object { Write-Host $_.Line }
+              Copy-Item $lg.FullName "C:\debug\$($lg.Name)" -Force -ErrorAction SilentlyContinue
+            }
+            Get-Process | Where-Object { $_.Name -match 'memu|vbox|microvirt' } | Format-Table Name, Id -AutoSize | Out-String | Write-Host
+          }
+          try {
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $bmp.Save("C:\debug\screen_boot.png")
+          } catch { Write-Host "Screenshot failed: $_" }
+          # FIX: leave VM fully stopped so the desktop START bat can start it cleanly
+          & $memuc stop -i 0 2>&1 | Out-Null
+          Start-Sleep 8
+          Get-Process -Name MEmu,MEmuHeadless,MEmuSVC -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Stop-Transcript | Out-Null
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: C:\debug\
+          if-no-files-found: ignore
+
+      # ══════════════════════════════════════════════
+      #  4c. scrcpy (phone screen viewer, software rendering)
+      #      + Mesa (software OpenGL, backup for MEmu window)
+      # ══════════════════════════════════════════════
+      - name: 4c. Install scrcpy and Mesa
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force C:\PhoneTools | Out-Null
+          $hdr = @{ "User-Agent" = "gh-runner" }
+
+          # ---- scrcpy ----
+          $urls = @()
+          try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/Genymobile/scrcpy/releases/latest" -Headers $hdr -TimeoutSec 60
+            $a = $rel.assets | Where-Object { $_.name -match '^scrcpy-win64-.*\.zip$' } | Select-Object -First 1
+            if ($a) { $urls += $a.browser_download_url }
+          } catch { Write-Host "GitHub API (scrcpy) failed: $_" -ForegroundColor Yellow }
+          $urls += "https://github.com/Genymobile/scrcpy/releases/download/v3.1/scrcpy-win64-v3.1.zip"
+          $urls += "https://github.com/Genymobile/scrcpy/releases/download/v2.7/scrcpy-win64-v2.7.zip"
+          $scOk = $false
+          foreach ($u in $urls) {
+            try {
+              Write-Host ">>> scrcpy: $u" -ForegroundColor Cyan
+              Invoke-WebRequest $u -OutFile C:\scrcpy.zip -UseBasicParsing -TimeoutSec 300
+              Remove-Item C:\PhoneTools\scrcpy -Recurse -Force -ErrorAction SilentlyContinue
+              Expand-Archive C:\scrcpy.zip -DestinationPath C:\PhoneTools\scrcpy -Force
+              $exe = Get-ChildItem C:\PhoneTools\scrcpy -Filter scrcpy.exe -Recurse | Select-Object -First 1
+              if ($exe) { Write-Host "scrcpy OK: $($exe.FullName)" -ForegroundColor Green; $scOk = $true; break }
+            } catch { Write-Host "scrcpy download failed: $_" -ForegroundColor Yellow }
+          }
+          if (-not $scOk) { Write-Host "scrcpy NOT installed - START will fall back to MEmu window." -ForegroundColor Red }
+
+          # ---- Mesa (software OpenGL) ----
+          try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $hdr -TimeoutSec 60
+            $a = $rel.assets | Where-Object { $_.name -match '^mesa3d-.*release-msvc\.7z$' } | Select-Object -First 1
+            if ($a) {
+              Write-Host ">>> Mesa: $($a.browser_download_url)" -ForegroundColor Cyan
+              Invoke-WebRequest $a.browser_download_url -OutFile C:\mesa.7z -UseBasicParsing -TimeoutSec 600
+              $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+              if (Test-Path $sevenZip) {
+                Remove-Item C:\mesa_tmp -Recurse -Force -ErrorAction SilentlyContinue
+                & $sevenZip x C:\mesa.7z -oC:\mesa_tmp -y | Out-Null
+                New-Item -ItemType Directory -Force C:\PhoneTools\MesaGL | Out-Null
+                foreach ($n in "opengl32.dll","libgallium_wgl.dll","libglapi.dll") {
+                  $f = Get-ChildItem C:\mesa_tmp\x64 -Filter $n -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($f) { Copy-Item $f.FullName C:\PhoneTools\MesaGL\ -Force; Write-Host "  mesa file: $n" }
+                }
+              } else { Write-Host "7-Zip not found - Mesa skipped." -ForegroundColor Yellow }
+            }
+          } catch { Write-Host "Mesa step failed (non-fatal): $_" -ForegroundColor Yellow }
+
+      # ══════════════════════════════════════════════
+      #  5. Find paths and create desktop tools
+      # ══════════════════════════════════════════════
+      - name: 5. Configure and Create Desktop Tools
+        shell: pwsh
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+
+          # Detect which emulator was installed
+          $emulatorType = "memu"
+          if (Test-Path "C:\emulator_type.txt") {
+            $emulatorType = (Get-Content "C:\emulator_type.txt" -Raw).Trim()
+          }
+          Write-Host "Configuring for: $emulatorType" -ForegroundColor Cyan
+
+          # Locate emulator exe + set port
+          $emulatorExe  = $null
+          $adbPort      = "21503"
+          $consoleName  = "memuc.exe"
+          $emuFilter    = if ($emulatorType -eq "nox") { "Nox.exe" } else { "MEmu.exe" }
+          if ($emulatorType -eq "nox") { $adbPort = "62001"; $consoleName = "NoxConsole.exe" }
+
+          foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            $f = Get-ChildItem $d.Root -Filter $emuFilter -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch 'NoxInstall|Uninstall' } |
+                 Select-Object -First 1
+            if ($f) { $emulatorExe = $f; break }
+          }
+          if (-not $emulatorExe) {
+            Write-Host "##[error] $emuFilter not found!"
+            exit 1
+          }
+          $emuRoot     = $emulatorExe.DirectoryName
+          $memuPath    = $emulatorExe.FullName   # used in bat templates
+          $adbExe      = Get-ChildItem $emuRoot -Filter "adb.exe" -Recurse -ErrorAction SilentlyContinue |
+                         Select-Object -First 1
+          $adbPath     = if ($adbExe) { $adbExe.FullName } else { "$emuRoot\adb.exe" }
+          $conExe      = Get-ChildItem $emuRoot -Filter $consoleName -Recurse -ErrorAction SilentlyContinue |
+                         Select-Object -First 1
+          $memuConsole = if ($conExe) { $conExe.FullName } else { "$emuRoot\$consoleName" }
+
+          Write-Host "Exe     : $memuPath"    -ForegroundColor Cyan
+          Write-Host "ADB     : $adbPath"     -ForegroundColor Cyan
+          Write-Host "Port    : $adbPort"     -ForegroundColor Cyan
+          Write-Host "Console : $memuConsole" -ForegroundColor Cyan
+          $memuRoot = $emuRoot   # FIX v8: $memuExe does not exist in this step (was null)
+
+          # Locate adb.exe (MEmu ships its own)
+          $adbExe = Get-ChildItem $memuRoot -Filter "adb.exe" -Recurse `
+                      -ErrorAction SilentlyContinue | Select-Object -First 1
+          $adbPath = if ($adbExe) { $adbExe.FullName } else { "$memuRoot\adb.exe" }
+
+          # MEmu ADB default port
+          $adbPort = "21503"
+
+          Write-Host "MEmu     : $memuPath"  -ForegroundColor Cyan
+          Write-Host "adb      : $adbPath"   -ForegroundColor Cyan
+          Write-Host "ADB port : $adbPort"   -ForegroundColor Cyan
+
+          # FILE 1 — 1 - START SAMSUNG PHONE.bat
+          # FIX: MEmu.exe crashes when launched cold after cleanup.
+          # Solution: use `memuc start` to boot the VM first (always works),
+          # then open MEmu.exe for the display window.
+          $memuConsole = "$memuRoot\memuc.exe"
+          $f1 = @(
+            '@echo off',
+            'title Samsung Galaxy S23 FE - MEmu Play',
+            'color 0A',
+            'echo.',
+            'echo  =====================================================',
+            'echo   SAMSUNG GALAXY S23 FE  -  MEmu Play',
+            'echo  =====================================================',
+            'echo.',
+            'echo [0/3] Locating MEmu executables...',
+            ':: Find memuc.exe at runtime - search common install paths',
+            'set "MEMUC="',
+            'set "MEMUE="',
+            'for /f "delims=" %%i in (''dir /s /b "D:\Program Files\Microvirt\memuc.exe" 2^>nul'') do if not defined MEMUC set "MEMUC=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "C:\Program Files\Microvirt\memuc.exe" 2^>nul'') do if not defined MEMUC set "MEMUC=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "D:\MEmu\memuc.exe" 2^>nul'') do if not defined MEMUC set "MEMUC=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "C:\MEmu\memuc.exe" 2^>nul'') do if not defined MEMUC set "MEMUC=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "D:\Program Files\Microvirt\MEmu.exe" 2^>nul'') do if not defined MEMUE set "MEMUE=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "C:\Program Files\Microvirt\MEmu.exe" 2^>nul'') do if not defined MEMUE set "MEMUE=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "D:\MEmu\MEmu.exe" 2^>nul'') do if not defined MEMUE set "MEMUE=%%i"',
+            'for /f "delims=" %%i in (''dir /s /b "C:\MEmu\MEmu.exe" 2^>nul'') do if not defined MEMUE set "MEMUE=%%i"',
+            'if not defined MEMUC echo   WARNING: memuc.exe not found - VM may not start correctly',
+            'if defined MEMUC echo   memuc: %MEMUC%',
+            'if defined MEMUE echo   MEmu : %MEMUE%',
+            'echo.',
+            'if not defined MEMUC (',
+            '  echo   ERROR: memuc.exe not found. MEmu is not installed correctly.',
+            '  pause & exit',
+            ')',
+            "set ADB=`"$adbPath`"",
+            "set PORT=$adbPort",
+            'set ATTEMPT=0',
+            'echo [1/4] Cleanly stopping old MEmu VM...',
+            'taskkill /F /IM scrcpy.exe >nul 2>&1',
+            '"%MEMUC%" stop -i 0 >nul 2>&1',
+            'timeout /t 8 /nobreak >nul',
+            'taskkill /F /IM MEmu.exe /IM MEmuHeadless.exe /IM MEmuSVC.exe >nul 2>&1',
+            'timeout /t 5 /nobreak >nul',
+            'echo [2/4] Setting DirectX mode...',
+            '"%MEMUC%" setconfigex -i 0 graphics_render_mode 1',
+            'timeout /t 2 /nobreak >nul',
+            ':TRYSTART',
+            'set /a ATTEMPT+=1',
+            'echo [3/4] Starting Android VM - attempt %ATTEMPT% of 3...',
+            '"%MEMUC%" start -i 0',
+            'set WAITS=0',
+            ':WAITBOOT',
+            'timeout /t 5 /nobreak >nul',
+            'set /a WAITS+=1',
+            '%ADB% connect 127.0.0.1:%PORT% >nul 2>&1',
+            'set BC=',
+            '%ADB% -s 127.0.0.1:%PORT% shell getprop sys.boot_completed > "%TEMP%\bc.txt" 2>nul',
+            'set /p BC=<"%TEMP%\bc.txt"',
+            'echo   waiting for Android boot... %WAITS%/24',
+            'if "%BC%"=="1" goto BOOTED',
+            'if %WAITS% LSS 24 goto WAITBOOT',
+            'echo   VM did not boot - cleaning up...',
+            '"%MEMUC%" stop -i 0 >nul 2>&1',
+            'timeout /t 8 /nobreak >nul',
+            'taskkill /F /IM MEmu.exe /IM MEmuHeadless.exe /IM MEmuSVC.exe >nul 2>&1',
+            'timeout /t 8 /nobreak >nul',
+            'if %ATTEMPT% LSS 3 goto TRYSTART',
+            'echo   FAILED 3 times. Send a photo of this window.',
+            'pause & exit',
+            ':BOOTED',
+            'echo   Android booted OK.',
+            'echo [4/4] Opening phone screen...',
+            'if exist "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat" (',
+            '  start "" "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"',
+            ') else if defined MEMUE (',
+            '  start "" "%MEMUE%"',
+            ') else (',
+            '  echo   MEmu.exe not found! Check if MEmu installed correctly.',
+            '  pause & exit',
+            ')',
+            'echo.',
+            'echo  Android is booted. The phone window opens in a few seconds.',
+            'echo  DO NOT close this window!',
+            'echo.',
+            'echo  When you see the phone home screen:',
+            'echo   1. Press any key here',
+            'echo   2. Then run:  2 - SETUP SPOOF.bat',
+            'echo.',
+            'pause',
+            'echo.',
+            'echo  Good. Now run:  2 - SETUP SPOOF.bat',
+            'echo.',
+            'pause'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText(
+            "$desk\\1 - START SAMSUNG PHONE.bat", $f1,
+            [System.Text.Encoding]::ASCII)
+
+          # FILE 1b — phone screen via scrcpy (software render, works without GPU)
+          New-Item -ItemType Directory -Force C:\PhoneTools | Out-Null
+          $scExe  = Get-ChildItem C:\PhoneTools\scrcpy -Filter scrcpy.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $scPath = if ($scExe) { $scExe.FullName } else { "" }
+          $fv = @(
+            '@echo off',
+            'title Phone Screen (scrcpy)',
+            "set `"ADB=$adbPath`"",
+            "set `"SCRCPY=$scPath`"",
+            "set `"MEMUE=$memuPath`"",
+            "set PORT=$adbPort",
+            'if "%SCRCPY%"=="" goto NOSC',
+            'if not exist "%SCRCPY%" goto NOSC',
+            'echo Connecting to Android...',
+            '"%ADB%" connect 127.0.0.1:%PORT%',
+            '"%SCRCPY%" -s 127.0.0.1:%PORT% --render-driver=software --max-size=1024 --max-fps=30 --video-bit-rate=4M --no-audio --window-title="Samsung S23 FE"',
+            'if errorlevel 1 (',
+            '  echo.',
+            '  echo   scrcpy closed with an error. Is Android booted? Run 1 - START first.',
+            '  pause',
+            ')',
+            'exit',
+            ':NOSC',
+            'echo scrcpy is not installed - opening the MEmu window instead.',
+            'start "" "%MEMUE%"',
+            'pause'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText("C:\PhoneTools\1b - OPEN PHONE SCREEN.bat", $fv, [System.Text.Encoding]::ASCII)
+
+          # Backup: MEmu's own window with software OpenGL (Mesa) copied next to MEmu.exe
+          $fb = @(
+            '@echo off',
+            'title MEmu Play 9 - backup window (Mesa OpenGL)',
+            "set `"MEMUE=$memuPath`"",
+            "set `"MROOT=$memuRoot`"",
+            'for %%f in (opengl32.dll libgallium_wgl.dll libglapi.dll) do if exist "C:\PhoneTools\MesaGL\%%f" copy /y "C:\PhoneTools\MesaGL\%%f" "%MROOT%\" >nul',
+            'start "" "%MEMUE%"',
+            'echo MEmu window launched with software OpenGL. Android must already be running (use 1 - START first).',
+            'timeout /t 5 /nobreak >nul'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText("C:\PhoneTools\MEmu Play 9 (backup window).bat", $fb, [System.Text.Encoding]::ASCII)
+
+          # FILE 2 — 2 - SETUP SPOOF.bat
+          # Key fixes:
+          # - TextNow: multiple download URLs with size check
+          # - gsm.* injection + persist check
+          # - Contacts VCF push (10 fake US contacts)
+          # - Reboot after memuc identity config (required for it to take effect)
+          $f2 = @(
+            '@echo off',
+            'title SETUP: Samsung S23 FE + US SIM + TextNow',
+            'color 0E',
+            "set ADB=`"$adbPath`"",
+            "set PORT=$adbPort",
+            "set `"MEMUC=$memuConsole`"",
+            'echo.',
+            'echo  =====================================================',
+            'echo   FULL SETUP: Samsung Identity + US SIM + TextNow',
+            'echo   Run AFTER MEmu shows the Android home screen',
+            'echo  =====================================================',
+            'echo.',
+            'echo [1/8] Connecting ADB + Root...',
+            '%ADB% connect 127.0.0.1:%PORT%',
+            'timeout /t 3 /nobreak >nul',
+            '%ADB% root',
+            'timeout /t 4 /nobreak >nul',
+            '%ADB% connect 127.0.0.1:%PORT%',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [2/8] Injecting US T-Mobile SIM card via setprop...',
+            'echo   NOTE: setprop is live-only. Applies until reboot.',
+            '%ADB% shell setprop gsm.sim.state READY',
+            '%ADB% shell setprop gsm.sim.operator.alpha T-Mobile',
+            '%ADB% shell setprop gsm.sim.operator.numeric 310260',
+            '%ADB% shell setprop gsm.sim.operator.iso-country us',
+            '%ADB% shell setprop gsm.operator.alpha T-Mobile',
+            '%ADB% shell setprop gsm.operator.numeric 310260',
+            '%ADB% shell setprop gsm.operator.iso-country us',
+            '%ADB% shell setprop gsm.network.type LTE',
+            '%ADB% shell setprop gsm.defaultpdpcontext.active true',
+            '%ADB% shell setprop ril.simready 1',
+            'echo   Verifying SIM state right now:',
+            '%ADB% shell getprop gsm.sim.state',
+            '%ADB% shell getprop gsm.operator.alpha',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [3/8] Samsung S23 FE identity — 3 methods for maximum coverage...',
+            'echo   Method A: memuc setconfigex (config file, persists on restart)',
+            '"%MEMUC%" setconfigex -i 0 manufacturer samsung 2>nul',
+            '"%MEMUC%" setconfigex -i 0 model SM-S711B 2>nul',
+            '"%MEMUC%" setconfigex -i 0 brand samsung 2>nul',
+            '"%MEMUC%" setconfigex -i 0 imei 358240055329871 2>nul',
+            '"%MEMUC%" setconfigex -i 0 property:ro.product.manufacturer=samsung 2>nul',
+            '"%MEMUC%" setconfigex -i 0 property:ro.product.model=SM-S711B 2>nul',
+            '"%MEMUC%" setconfigex -i 0 property:ro.product.brand=samsung 2>nul',
+            'echo   Method B: /data/local.prop (processed by Android init on boot)',
+            '%ADB% shell "printf ''ro.product.manufacturer=samsung\nro.product.model=SM-S711B\nro.product.brand=samsung\nro.product.device=s5e9925\nro.product.name=SM-S711B\nro.build.fingerprint=samsung/SM-S711BXXS3AXEF/s5e9925:14/UP1A.231005.007/S711BXXS3AXEF:user/release-keys\n'' > /data/local.prop"',
+            '%ADB% shell chmod 644 /data/local.prop',
+            '%ADB% shell cat /data/local.prop',
+            'echo   Method C: persist.* properties (survive reboot)',
+            '%ADB% shell setprop persist.sys.timezone America/New_York',
+            '%ADB% shell settings put global time_zone America/New_York',
+            '%ADB% shell setprop persist.gsm.operator.iso-country us',
+            'echo   All methods applied. Rebooting will activate /data/local.prop.',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [4/8] Clearing Google Play Services cache...',
+            '%ADB% shell pm clear com.google.android.gms',
+            '%ADB% shell pm clear com.android.vending',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [5/8] Pushing fake US contacts (makes account look natural)...',
+            'echo BEGIN:VCARD>C:\Users\Public\contacts.vcf',
+            'echo VERSION:3.0>>C:\Users\Public\contacts.vcf',
+            'echo FN:James Williams>>C:\Users\Public\contacts.vcf',
+            'echo TEL:+12125551234>>C:\Users\Public\contacts.vcf',
+            'echo END:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo BEGIN:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo VERSION:3.0>>C:\Users\Public\contacts.vcf',
+            'echo FN:Sarah Johnson>>C:\Users\Public\contacts.vcf',
+            'echo TEL:+13105552345>>C:\Users\Public\contacts.vcf',
+            'echo END:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo BEGIN:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo VERSION:3.0>>C:\Users\Public\contacts.vcf',
+            'echo FN:Michael Brown>>C:\Users\Public\contacts.vcf',
+            'echo TEL:+16465553456>>C:\Users\Public\contacts.vcf',
+            'echo END:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo BEGIN:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo VERSION:3.0>>C:\Users\Public\contacts.vcf',
+            'echo FN:Emily Davis>>C:\Users\Public\contacts.vcf',
+            'echo TEL:+14155554567>>C:\Users\Public\contacts.vcf',
+            'echo END:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo BEGIN:VCARD>>C:\Users\Public\contacts.vcf',
+            'echo VERSION:3.0>>C:\Users\Public\contacts.vcf',
+            'echo FN:Robert Wilson>>C:\Users\Public\contacts.vcf',
+            'echo TEL:+13125555678>>C:\Users\Public\contacts.vcf',
+            'echo END:VCARD>>C:\Users\Public\contacts.vcf',
+            '%ADB% push C:\Users\Public\contacts.vcf /sdcard/Download/contacts.vcf',
+            'timeout /t 2 /nobreak >nul',
+            'echo   Contacts VCF pushed to phone.',
+            'echo   After reboot: Contacts app > Import > From storage > contacts.vcf',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [6/8] Downloading TextNow APK (free US phone number)...',
+            'del /Q "C:\textnow.apk" 2>nul',
+            'curl.exe -L -f --retry 3 --retry-delay 5 --max-time 90 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" -o "C:\textnow.apk" "https://apkpure.net/textnow-free-texting-calling-app/com.enflick.android.TextNow/download" 2>nul',
+            'if not exist "C:\textnow.apk" goto :tn2',
+            'for %%A in ("C:\textnow.apk") do if %%~zA lss 1000000 goto :tn2',
+            'goto :tn_install',
+            ':tn2',
+            'echo   First URL failed, trying mirror...',
+            'del /Q "C:\textnow.apk" 2>nul',
+            'curl.exe -L -f --retry 3 --retry-delay 5 --max-time 90 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" -o "C:\textnow.apk" "https://d.apkpure.net/b/APK/com.enflick.android.TextNow?nc=arm64-v8a&sr=high" 2>nul',
+            'if not exist "C:\textnow.apk" goto :tn_manual',
+            'for %%A in ("C:\textnow.apk") do if %%~zA lss 1000000 goto :tn_manual',
+            ':tn_install',
+            '%ADB% install -r "C:\textnow.apk"',
+            'echo   TextNow installed OK.',
+            'goto :tn_done',
+            ':tn_manual',
+            'echo   Auto-download failed.',
+            'echo   Install TextNow manually: Play Store inside MEmu, search TextNow',
+            ':tn_done',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [7/8] adb remount for build.prop spoof (bonus if /system writable)...',
+            '%ADB% remount 2>nul',
+            'timeout /t 3 /nobreak >nul',
+            '%ADB% shell "sed -i ''s/ro.product.manufacturer=.*/ro.product.manufacturer=samsung/'' /system/build.prop 2>/dev/null"',
+            '%ADB% shell "sed -i ''s/ro.product.model=.*/ro.product.model=SM-S711B/'' /system/build.prop 2>/dev/null"',
+            '%ADB% shell "sed -i ''s/ro.product.brand=.*/ro.product.brand=samsung/'' /system/build.prop 2>/dev/null"',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [8/8] REBOOTING VM to apply Samsung identity...',
+            'echo   (gsm.* setprop will reset - re-run step 2 manually after reboot if needed)',
+            'taskkill /F /IM scrcpy.exe >nul 2>&1',
+            '"%MEMUC%" stop -i 0',
+            'timeout /t 10 /nobreak >nul',
+            '"%MEMUC%" start -i 0',
+            'echo   Waiting for Android to reboot (45 seconds)...',
+            'timeout /t 45 /nobreak',
+            'echo.',
+            'echo  =====================================================',
+            'echo   REBOOT DONE. Android should be loading.',
+            'echo.',
+            'echo   RE-APPLY SIM AFTER REBOOT (setprop resets on reboot):',
+            '%ADB% connect 127.0.0.1:%PORT% 2>nul',
+            '%ADB% root 2>nul',
+            'timeout /t 3 /nobreak >nul',
+            '%ADB% shell setprop gsm.sim.state READY 2>nul',
+            '%ADB% shell setprop gsm.operator.alpha T-Mobile 2>nul',
+            '%ADB% shell setprop gsm.operator.numeric 310260 2>nul',
+            '%ADB% shell setprop gsm.operator.iso-country us 2>nul',
+            'echo   SIM re-applied.',
+            'if exist "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat" start "" "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"',
+            'echo.',
+            'echo  =====================================================',
+            'echo   SETUP COMPLETE - Now create Gmail:',
+            'echo.',
+            'echo   1. Open TextNow app in MEmu',
+            'echo   2. Create TextNow account',
+            'echo   3. Get FREE US number - WRITE IT DOWN',
+            'echo.',
+            'echo   4. Settings > Accounts > Add Account > Google',
+            'echo.',
+            'echo   5. ON CARRIER VERIFY SCREEN:',
+            'echo      Scroll DOWN then click SKIP at bottom-left',
+            'echo      DO NOT click Next or Get Code',
+            'echo.',
+            'echo   6. Enter TextNow number manually',
+            'echo   7. Get SMS code from TextNow app',
+            'echo   8. Done!',
+            'echo  =====================================================',
+            'echo.',
+            'pause'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText(
+            "$desk\2 - SETUP SPOOF.bat", $f2,
+            [System.Text.Encoding]::ASCII)
+
+          # FILE 2b — 3 - CREATE GMAIL.bat
+          # KEY INSIGHT: Google web signup via Chrome browser bypasses
+          # carrier-level verification that blocks Android native signup.
+          # Web form uses captcha/SMS only - no carrier API call.
+          $f2b = @(
+            '@echo off',
+            'title 3 - CREATE GMAIL (Browser Method)',
+            'color 0B',
+            "set ADB=`"$adbPath`"",
+            "set PORT=$adbPort",
+            'echo.',
+            'echo  =====================================================',
+            'echo   GMAIL CREATION - BROWSER METHOD',
+            'echo  =====================================================',
+            'echo.',
+            'echo [0/3] Checking public IP (must be residential)...',
+            'powershell -Command "try{$ip=(Invoke-WebRequest https://api.ipify.org -UseBasicParsing -TimeoutSec 8).Content.Trim();Write-Host IP: $ip}catch{Write-Host Could not check IP}"',
+            'echo.',
+            'echo   IMPORTANT: If IP shows Azure datacenter address,',
+            'echo   Gmail creation will FAIL. Set TAILSCALE_EXIT_NODE secret first.',
+            'echo   (See 3 - GUIDE for instructions)',
+            'echo.',
+            'echo [1/3] Reconnecting ADB...',
+            '%ADB% connect 127.0.0.1:%PORT% >nul 2>&1',
+            '%ADB% root >nul 2>&1',
+            'timeout /t 3 /nobreak >nul',
+            'echo.',
+            'echo [2/3] Re-applying US SIM properties (setprop resets on reboot)...',
+            '%ADB% shell setprop gsm.sim.state READY',
+            '%ADB% shell setprop gsm.operator.alpha T-Mobile',
+            '%ADB% shell setprop gsm.operator.numeric 310260',
+            '%ADB% shell setprop gsm.operator.iso-country us',
+            '%ADB% shell getprop gsm.sim.state',
+            'timeout /t 2 /nobreak >nul',
+            'echo.',
+            'echo [3/3] Opening Google account signup in CHROME browser...',
+            'echo   (browser signup does NOT do carrier check!)',
+            '%ADB% shell am start -a android.intent.action.VIEW -d "https://accounts.google.com/signup/v2/webclientchooser?service=mail"',
+            'timeout /t 3 /nobreak >nul',
+            'echo.',
+            'echo  =====================================================',
+            'echo   Chrome opened to Google signup page.',
+            'echo.',
+            'echo   FILL OUT THE FORM:',
+            'echo   - First name, Last name',
+            'echo   - Username (your desired gmail address)',
+            'echo   - Password',
+            'echo.',
+            'echo   WHEN PHONE NUMBER IS ASKED:',
+            'echo.',
+            'echo   BEST OPTION - esimplus.me (real eSIM numbers, free tier):',
+            'echo     1. On your PC: go to esimplus.me/temporary-numbers',
+            'echo     2. Choose United States',
+            'echo     3. Get a temporary number (no app needed)',
+            'echo     4. Enter that number in the Google form',
+            'echo     5. Check esimplus.me for the SMS code',
+            'echo.',
+            'echo   OPTION B - 5sim.net (~$0.20, most reliable):',
+            'echo     1. On your PC: go to 5sim.net',
+            'echo     2. Buy a Google/USA number',
+            'echo     3. Enter it here, check code on 5sim.net',
+            'echo.',
+            'echo   OPTION C - TextNow (free but needs Play Store first):',
+            'echo     If TextNow is installed: check number in app',
+            'echo.',
+            'echo   Try SKIP if visible (some accounts skip phone)',
+            'echo.',
+            'echo   IMPORTANT: Use this Chrome browser method',
+            'echo   NOT Settings, Add Account',
+            'echo  =====================================================',
+            'echo.',
+            'pause'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText(
+            "$desk\3 - CREATE GMAIL.bat", $f2b,
+            [System.Text.Encoding]::ASCII)
+          Copy-Item "$desk\3 - CREATE GMAIL.bat" C:\PhoneTools\ -Force -ErrorAction SilentlyContinue
+
+          # FILE 3 — Guide
+          $f3 = @(
+            'SAMSUNG S23 FE - GMAIL CREATOR',
+            '================================',
+            '',
+            'WHAT GOOGLE ACTUALLY CHECKS:',
+            '  [1] Device integrity (Play Integrity API)',
+            '      -> Samsung S23 FE spoof helps here',
+            '  [2] Carrier-level SIM check (direct API call to T-Mobile/AT&T)',
+            '      -> setprop CANNOT bypass this - Google calls carrier network',
+            '      -> Solution: use Chrome browser signup instead!',
+            '  [3] Phone number SMS verification',
+            '      -> Use TextNow (free) or 5sim.net (paid, reliable)',
+            '',
+            'WHY BROWSER METHOD WORKS:',
+            '  accounts.google.com in Chrome = web signup flow',
+            '  Web flow does NOT do carrier-level check',
+            '  Only asks for SMS code on a number you provide',
+            '  TextNow or 5sim.net works here',
+            '',
+            '================================================',
+            '',
+            'STEP 0 - CRITICAL: Set up residential IP FIRST',
+            '  Without this step, Gmail creation will fail on Azure IP.',
+            '',
+            '  On your HOME PC (one-time setup):',
+            '  a) Open Tailscale on your PC',
+            '  b) Click your username > Settings',
+            '  c) Enable: "Use as exit node" (or Advertise as exit node)',
+            '  d) Find your Tailscale IP: run tailscale ip -4 in terminal',
+            '     (looks like 100.x.x.x)',
+            '',
+            '  On GitHub (one-time setup):',
+            '  a) Your repo > Settings > Secrets and variables > Actions',
+            '  b) New repository secret:',
+            '     Name  : TAILSCALE_EXIT_NODE',
+            '     Value : your Tailscale IP (100.x.x.x)',
+            '',
+            '  Result: ALL traffic from the server routes through your',
+            '  home internet connection (residential IP). Google accepts it.',
+            '',
+            '================================================',
+            '',
+            'STEP 1 - Start the phone',
+            '  Run: 1 - START SAMSUNG PHONE.bat',
+            '  Wait for Android home screen (1-3 min)',
+            '  The scrcpy window shows the phone',
+            '',
+            'STEP 2 - Apply Samsung identity + US SIM',
+            '  Run: 2 - SETUP SPOOF.bat',
+            '  This takes ~3 min and reboots the VM at the end',
+            '  Wait for it to fully reboot',
+            '',
+            'STEP 3 - Get a free US phone number',
+            '  Open TextNow app inside MEmu',
+            '  Create a TextNow account (use any email)',
+            '  Go to Account > Get a free number',
+            '  WRITE DOWN the number (+1-XXX-XXX-XXXX format)',
+            '',
+            'STEP 4 - Create Gmail (use the BROWSER method!)',
+            '',
+            '  Run: 3 - CREATE GMAIL.bat',
+            '  This opens Chrome in MEmu to accounts.google.com',
+            '',
+            '  Fill out the form:',
+            '  - First/Last name, username, password',
+            '',
+            '  When phone number is asked:',
+            '',
+            '  FREE OPTION (TextNow):',
+            '  -> Open TextNow app, go to Account',
+            '  -> Copy your US number (+1-XXX-XXX-XXXX)',
+            '  -> Enter it in the Google form',
+            '  -> Get the SMS code from TextNow Messages',
+            '',
+            '  PAID OPTION (5sim.net - most reliable):',
+            '  -> On your PC: go to 5sim.net',
+            '  -> Buy a Google/USA number (~$0.20)',
+            '  -> Enter it in the Google form',
+            '  -> Get code from 5sim.net website',
+            '',
+            '  WHY NOT Settings > Add Account:',
+            '  -> Android native flow does carrier network check',
+            '  -> This check cannot be bypassed on emulator',
+            '  -> Browser form does NOT do this check',
+            '',
+            'STEP 5 - Import contacts (optional)',
+            '  Open Contacts app',
+            '  Menu > Import > From storage',
+            '  Select contacts.vcf (in Downloads folder)',
+            '  Tap Import all',
+            '',
+            '================================================',
+            '',
+            'PHONE NUMBER OPTIONS (best to worst):',
+            '  1. esimplus.me/temporary-numbers (BEST - real eSIM, free tier)',
+            '     Real eSIM numbers, not VoIP, Google accepts them',
+            '     Web-based - no app needed in MEmu',
+            '',
+            '  2. 5sim.net (~$0.20 per number)',
+            '     Real carrier numbers, 95% success rate',
+            '',
+            '  3. TextNow (free but needs Play Store / Google account first)',
+            '     Circular dependency - hard to install without Google',
+            '',
+            'Device identity after SETUP:',
+            '  Model   : Samsung Galaxy S23 FE (SM-S711B)',
+            '  Carrier : T-Mobile US',
+            '  SIM     : READY (US)'
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText(
+            "$desk\3 - GUIDE (READ FIRST).txt", $f3,
+            [System.Text.Encoding]::UTF8)
+
+          # Copy everything to C:\PhoneTools too, and put real shortcuts on the Desktop
+          Copy-Item "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"      "$desk\" -Force
+          Copy-Item "C:\PhoneTools\MEmu Play 9 (backup window).bat" "$desk\" -Force
+          Copy-Item "$desk\1 - START SAMSUNG PHONE.bat" C:\PhoneTools\ -Force
+          Copy-Item "$desk\2 - SETUP SPOOF.bat"         C:\PhoneTools\ -Force
+          try {
+            $ws = New-Object -ComObject WScript.Shell
+            $s = $ws.CreateShortcut("$desk\MEmu Play 9.lnk")
+            $s.TargetPath = $memuPath; $s.WorkingDirectory = (Split-Path $memuPath); $s.Save()
+            $s = $ws.CreateShortcut("$desk\Phone Screen.lnk")
+            $s.TargetPath = "C:\PhoneTools\1b - OPEN PHONE SCREEN.bat"; $s.WorkingDirectory = "C:\PhoneTools"
+            $s.IconLocation = "$memuPath,0"; $s.Save()
+            Write-Host "Shortcuts created." -ForegroundColor Green
+          } catch { Write-Host "Shortcut creation failed: $_" -ForegroundColor Yellow }
+
+          Write-Host "Desktop toolkit created." -ForegroundColor Green
+          Write-Host "  1 - START SAMSUNG PHONE.bat" -ForegroundColor Yellow
+          Write-Host "  2 - SETUP SPOOF.bat"         -ForegroundColor Yellow
+          Write-Host "  3 - GUIDE (READ FIRST).txt"  -ForegroundColor Yellow
+
+          # ── Activate exit node NOW — all installations done ───────────────
+          # From this point, all traffic (including MEmu internet) routes
+          # through the user's home PC (residential IP). Gmail creation works.
+          $exitNode = $Env:TAILSCALE_EXIT_NODE
+          if ($exitNode -and $exitNode.Trim() -ne "") {
+            Write-Host ""
+            Write-Host ">>> Activating exit node: $exitNode" -ForegroundColor Cyan
+            $tsOut = & "C:\Program Files\Tailscale\tailscale.exe" set `
+              --exit-node="$($exitNode.Trim())" `
+              --exit-node-allow-lan-access 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host ">>> Exit node error: $tsOut" -ForegroundColor Red
+              Write-Host "    FIX: https://login.tailscale.com/admin/machines" -ForegroundColor Yellow
+              Write-Host "    desktop-dexter → ... → Edit route settings → 'Use as exit node' ✓ → Save" -ForegroundColor Yellow
+            } else {
+              Start-Sleep 5
+              try {
+                $pubip = (Invoke-WebRequest "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Content.Trim()
+                if ($pubip -match '^20\.|^52\.|^40\.|^104\.|^13\.') {
+                  Write-Host ">>> IP: $pubip (still Azure — exit node may not be approved yet)" -ForegroundColor Yellow
+                } else {
+                  Write-Host ">>> Exit node ACTIVE. Public IP: $pubip (residential ✓)" -ForegroundColor Green
+                  Write-Host ">>> MEmu internet will use YOUR home IP. Gmail creation will work." -ForegroundColor Green
+                }
+              } catch {
+                Write-Host ">>> Exit node set but could not verify IP: $_" -ForegroundColor Yellow
+              }
+            }
+          } else {
+            Write-Host ">>> No exit node — downloads complete, but Gmail may fail on Azure IP." -ForegroundColor Yellow
+          }
+          Write-Host "  1b - OPEN PHONE SCREEN.bat / Phone Screen.lnk / MEmu Play 9.lnk / backup window" -ForegroundColor Yellow
+
+      # ══════════════════════════════════════════════
+      #  6. Keep server alive (6 hours)
+      # ══════════════════════════════════════════════
+      - name: 6. Keep Server Alive
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 360; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/360] Server alive..."
+          }

@@ -69,10 +69,11 @@ jobs:
           # Activating here would route ALL downloads through Iran — blocking MEmu/Nox CDNs.
           $exitNode = $Env:TAILSCALE_EXIT_NODE
           if ($exitNode -and $exitNode.Trim() -ne "") {
-            Write-Host ">>> Exit node $exitNode will be activated AFTER installation." -ForegroundColor Cyan
-            Write-Host "    (Downloads stay on Azure network; exit node activates for Gmail creation)" -ForegroundColor Gray
+            # Save to file so step 5 can read it (env vars don't cross steps)
+            $exitNode.Trim() | Set-Content "C:\ts_exit.txt" -Encoding ASCII
+            Write-Host ">>> Exit node $($exitNode.Trim()) saved. Will activate after installation." -ForegroundColor Cyan
           } else {
-            Write-Host ">>> No TAILSCALE_EXIT_NODE set — Gmail creation may fail on Azure IP." -ForegroundColor Yellow
+            Write-Host ">>> No TAILSCALE_EXIT_NODE set — Gmail may fail on Azure IP." -ForegroundColor Yellow
           }
 
       # ══════════════════════════════════════════════
@@ -1046,9 +1047,13 @@ jobs:
           # ── Activate exit node NOW — all installations done ───────────────
           # From this point, all traffic (including MEmu internet) routes
           # through the user's home PC (residential IP). Gmail creation works.
-          $exitNode = $Env:TAILSCALE_EXIT_NODE
-          if ($exitNode -and $exitNode.Trim() -ne "") {
+          $exitNode = ""
+          if (Test-Path "C:\ts_exit.txt") {
+            $exitNode = (Get-Content "C:\ts_exit.txt" -Raw).Trim()
             Write-Host ""
+            Write-Host ">>> Read exit node from file: $exitNode" -ForegroundColor Cyan
+          }
+          if ($exitNode -ne "") {
             Write-Host ">>> Activating exit node: $exitNode" -ForegroundColor Cyan
             $tsOut = & "C:\Program Files\Tailscale\tailscale.exe" set `
               --exit-node="$($exitNode.Trim())" `

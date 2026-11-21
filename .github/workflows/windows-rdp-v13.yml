@@ -5,7 +5,9 @@ name: Windows Cloud RDP
 
 jobs:
   build:
-    runs-on: windows-latest
+    # FIX: 'windows-latest' now points to the NEW image windows-2025-vs2026 (seen in the log). The MEmu
+    # installer exits with -7 on it. 'windows-2025' is the previous image that your first successful run used.
+    runs-on: windows-2025
     timeout-minutes: 360
 
     steps:
@@ -118,7 +120,9 @@ jobs:
             try {
               $dst = "C:\debug\install-$tag"
               New-Item $dst -ItemType Directory -Force | Out-Null
-              foreach ($dir in @($env:TEMP, "C:\Windows\Temp")) {
+              $tmpDirs = @($env:TEMP, "C:\Windows\Temp", "C:\ProgramData") + @(Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName "AppData\Local\Temp" })
+              foreach ($dir in $tmpDirs) {
+                if (-not (Test-Path $dir)) { continue }
                 Get-ChildItem $dir -File -ErrorAction SilentlyContinue |
                   Where-Object { $_.LastWriteTime -gt $script:diagStart -and $_.Length -lt 30MB -and $_.Extension -match '\.(log|txt)$' } |
                   ForEach-Object { Copy-Item $_.FullName (Join-Path $dst ($_.Directory.Name + "_" + $_.Name)) -Force -ErrorAction SilentlyContinue }

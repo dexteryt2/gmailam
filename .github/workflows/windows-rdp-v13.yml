@@ -5,9 +5,7 @@ name: Windows Cloud RDP
 
 jobs:
   build:
-    # FIX: 'windows-latest' now points to the NEW image windows-2025-vs2026 (seen in the log). The MEmu
-    # installer exits with -7 on it. 'windows-2025' is the previous image that your first successful run used.
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -174,6 +172,11 @@ jobs:
             Write-Host "    Defender exclusions added." -ForegroundColor Gray
           } catch { Write-Host "    Defender config failed (may still work): $_" -ForegroundColor Gray }
 
+          try {
+            $depPol = (Get-CimInstance Win32_OperatingSystem).DataExecutionPrevention_SupportPolicy
+            $cpuN   = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+            Write-Host "  DEP policy: $depPol (0=AlwaysOff 1=AlwaysOn 2=OptIn 3=OptOut) | CPU: $cpuN" -ForegroundColor Gray
+          } catch {}
           # Verbose Windows Installer logging: shows WHY msiexec (run by the MEmu setup) fails
           try {
             $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
@@ -247,42 +250,45 @@ jobs:
             } else {
               Write-Host "MEmu.exe not found after first attempt." -ForegroundColor Yellow
               Save-InstallDiag "first"
-              Write-Host ">>> RETRY: Running installer again (prereqs may now be installed)..." -ForegroundColor Yellow
-              # Second run succeeds because VirtualBox prereqs are already installed from first run
-              try {
-                # A/B TEST: first attempt ran with Defender real-time OFF and exited -7.
-                # Retry with it back ON, to learn whether disabling Defender is what breaks the installer.
-                try { Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue; Write-Host "    Defender real-time re-enabled for retry (A/B test)" -ForegroundColor Gray } catch {}
-                $script:diagStart = Get-Date
-                $proc2 = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
-                if ($proc2) {
+              Write-Host ">>> RETRY with DEP exemption / compatibility layers..." -ForegroundColor Yellow
+              # Evidence (debug artifact): memu_setup.exe itself crashes, exception 0xC0000005, first fault in an
+              # 'unknown' module = code executing from non-executable memory (DEP). Windows Server defaults to DEP
+              # "OptOut" (applies to ALL programs), client Windows does not - so a packed installer can crash here.
+              $layerKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
+              $layerN = 0
+              foreach ($layer in @('DisableNXShowUI','WIN7RTM DisableNXShowUI','WIN8RTM DisableNXShowUI')) {
+                if ($installed) { break }
+                $layerN++
+                Write-Host "    >>> installer attempt with layer: $layer" -ForegroundColor Cyan
+                try {
+                  New-Item $layerKey -Force | Out-Null
+                  Set-ItemProperty $layerKey -Name $memuInst -Value $layer
+                  $env:__COMPAT_LAYER = $layer
+                  $script:diagStart = Get-Date
+                  $proc2 = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
                   $t2 = 0
-                  while (-not $proc2.HasExited -and $t2 -lt 600) {
+                  while (-not $proc2.HasExited -and $t2 -lt 900) {
                     Start-Sleep 15; $t2 += 15
-                    Write-Host "    retry installing... ${t2}s" -ForegroundColor Gray
+                    Write-Host "    installing... ${t2}s" -ForegroundColor Gray
                   }
-                  Write-Host "    retry exit code: $($proc2.ExitCode)" -ForegroundColor Gray
+                  Write-Host "    exit code: $($proc2.ExitCode)" -ForegroundColor Gray
+                } catch { Write-Host "    launch error: $_" -ForegroundColor Yellow }
+                finally { Remove-Item Env:\__COMPAT_LAYER -ErrorAction SilentlyContinue }
+                $w2 = 0
+                while ((Get-Process msiexec -ErrorAction SilentlyContinue) -and $w2 -lt 300) {
+                  Start-Sleep 15; $w2 += 15
+                  Write-Host "    msiexec still running... ${w2}s" -ForegroundColor Gray
                 }
-              } catch { Write-Host "    retry error: $_" -ForegroundColor Yellow }
-              $w2 = 0
-              while ((Get-Process msiexec -ErrorAction SilentlyContinue) -and $w2 -lt 300) {
-                Start-Sleep 15; $w2 += 15
-                Write-Host "    msiexec still running... ${w2}s" -ForegroundColor Gray
-              }
-              Start-Sleep 25
-              $fr = $null
-              foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
-                foreach ($sub in "Program Files\Microvirt\MEmu","Program Files (x86)\Microvirt\MEmu","MEmu") {
-                  $pp = Join-Path $d.Root "$sub\MEmu.exe"
-                  if (Test-Path $pp) { $fr = Get-Item $pp; break }
+                Start-Sleep 20
+                $fr = Find-Exe "MEmu.exe"
+                if ($fr) {
+                  Write-Host ">>> MEmu INSTALLED (layer: $layer): $($fr.FullName)" -ForegroundColor Green
+                  $installed=$true; $emulatorType="memu"
+                } else {
+                  Write-Host "    still not installed with layer: $layer" -ForegroundColor Yellow
+                  Save-InstallDiag ("layer$layerN")
                 }
-                if ($fr) { break }
               }
-              if (-not $fr) { $fr = Find-Exe "MEmu.exe" }
-              if ($fr) {
-                Write-Host ">>> MEmu INSTALLED on retry: $($fr.FullName)" -ForegroundColor Green
-                $installed=$true; $emulatorType="memu"
-              } else { Write-Host "MEmu.exe still not found after retry." -ForegroundColor Yellow; Save-InstallDiag "retry" }
             }
           } else { Write-Host "curl failed ($sz bytes) — moving on." -ForegroundColor Yellow }
 

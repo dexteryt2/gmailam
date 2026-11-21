@@ -127,6 +127,17 @@ jobs:
             "-o", $memuInst,
             "https://dl.memuplay.com/download/Memu-Setup.exe"
           )
+          # Disable Defender real-time scan to prevent installer crash (0xC0000005)
+          Write-Host ">>> Disabling Defender real-time monitoring for install..." -ForegroundColor Cyan
+          try {
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath "C:\memu_setup.exe" -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath "C:\ld9.exe"        -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath "C:\Program Files\Microvirt" -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionPath "D:\Program Files\Microvirt" -ErrorAction SilentlyContinue
+            Write-Host "    Defender exclusions added." -ForegroundColor Gray
+          } catch { Write-Host "    Defender config failed (may still work): $_" -ForegroundColor Gray }
+
           Write-Host "  Downloading 729 MB — progress bar below (1-40 min):" -ForegroundColor Gray
           Write-Host "  DO NOT cancel during download or install." -ForegroundColor Yellow
           $memuUrl = "https://dl.memuplay.com/download/Memu-Setup.exe"
@@ -189,7 +200,41 @@ jobs:
             if ($f) {
               Write-Host ">>> MEmu INSTALLED: $($f.FullName)" -ForegroundColor Green
               $installed=$true; $emulatorType="memu"
-            } else { Write-Host "MEmu.exe not found after install." -ForegroundColor Yellow }
+            } else {
+              Write-Host "MEmu.exe not found after first attempt." -ForegroundColor Yellow
+              Write-Host ">>> RETRY: Running installer again (prereqs may now be installed)..." -ForegroundColor Yellow
+              # Second run succeeds because VirtualBox prereqs are already installed from first run
+              try {
+                $proc2 = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
+                if ($proc2) {
+                  $t2 = 0
+                  while (-not $proc2.HasExited -and $t2 -lt 600) {
+                    Start-Sleep 15; $t2 += 15
+                    Write-Host "    retry installing... ${t2}s" -ForegroundColor Gray
+                  }
+                  Write-Host "    retry exit code: $($proc2.ExitCode)" -ForegroundColor Gray
+                }
+              } catch { Write-Host "    retry error: $_" -ForegroundColor Yellow }
+              $w2 = 0
+              while ((Get-Process msiexec -ErrorAction SilentlyContinue) -and $w2 -lt 300) {
+                Start-Sleep 15; $w2 += 15
+                Write-Host "    msiexec still running... ${w2}s" -ForegroundColor Gray
+              }
+              Start-Sleep 25
+              $fr = $null
+              foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+                foreach ($sub in "Program Files\Microvirt\MEmu","Program Files (x86)\Microvirt\MEmu","MEmu") {
+                  $pp = Join-Path $d.Root "$sub\MEmu.exe"
+                  if (Test-Path $pp) { $fr = Get-Item $pp; break }
+                }
+                if ($fr) { break }
+              }
+              if (-not $fr) { $fr = Find-Exe "MEmu.exe" }
+              if ($fr) {
+                Write-Host ">>> MEmu INSTALLED on retry: $($fr.FullName)" -ForegroundColor Green
+                $installed=$true; $emulatorType="memu"
+              } else { Write-Host "MEmu.exe still not found after retry." -ForegroundColor Yellow }
+            }
           } else { Write-Host "curl failed ($sz bytes) — moving on." -ForegroundColor Yellow }
 
           # ════════════════════════════════════════════════════════
@@ -222,7 +267,9 @@ jobs:
             $noxInst = "C:\nox_setup.exe"
             $noxUrls = @(
               "https://res-download-hw.bignox.com/full/NoxPlayer_installer.exe",
-              "https://res.bignox.com/full/NoxPlayer_installer.exe"
+              "https://res.bignox.com/full/NoxPlayer_installer.exe",
+              "https://res-download.bignox.com/full/NoxPlayer_installer.exe",
+              "https://noxdownload.bignox.com/full/NoxPlayer_installer.exe"
             )
             foreach ($url in $noxUrls) {
               Write-Host "  Downloading NoxPlayer from: $url" -ForegroundColor Cyan

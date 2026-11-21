@@ -98,12 +98,44 @@ jobs:
 
           # ── Helper: find exe after install ───────────────────────────────
           function Find-Exe($name) {
+            # FIX: limited search (the old full-drive scan took ~7.5 minutes when nothing was installed)
             foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
-              $f = Get-ChildItem $d.Root -Filter $name -Recurse -ErrorAction SilentlyContinue |
-                   Select-Object -First 1
-              if ($f) { return $f }
+              foreach ($sub in "Program Files","Program Files (x86)","Microvirt","MEmu","Nox","ProgramData") {
+                $root = Join-Path $d.Root $sub
+                if (Test-Path $root) {
+                  $f = Get-ChildItem $root -Filter $name -Recurse -Depth 5 -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($f) { return $f }
+                }
+              }
             }
             return $null
+          }
+
+          # ── Diagnostics: saves installer/MSI logs + event log to C:\debug (uploaded as artifact) ──
+          $script:diagStart = Get-Date
+          function Save-InstallDiag($tag) {
+            Write-Host "----- INSTALL DIAGNOSTICS ($tag) -----" -ForegroundColor Magenta
+            try {
+              $dst = "C:\debug\install-$tag"
+              New-Item $dst -ItemType Directory -Force | Out-Null
+              foreach ($dir in @($env:TEMP, "C:\Windows\Temp")) {
+                Get-ChildItem $dir -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.LastWriteTime -gt $script:diagStart -and $_.Length -lt 30MB -and $_.Extension -match '\.(log|txt)$' } |
+                  ForEach-Object { Copy-Item $_.FullName (Join-Path $dst ($_.Directory.Name + "_" + $_.Name)) -Force -ErrorAction SilentlyContinue }
+              }
+              Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$script:diagStart} -MaxEvents 80 -ErrorAction SilentlyContinue |
+                Where-Object { $_.LevelDisplayName -in 'Error','Warning' } |
+                Select-Object TimeCreated, ProviderName, Id, Message | Format-List | Out-String -Width 220 | Set-Content "$dst\events.txt"
+              Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free -AutoSize | Out-String | Set-Content "$dst\drives.txt"
+              try { Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled | Out-String | Set-Content "$dst\defender.txt" } catch {}
+              Write-Host "  Saved files:" -ForegroundColor Gray
+              Get-ChildItem $dst | ForEach-Object { Write-Host ("    {0}  ({1} KB)" -f $_.Name, [math]::Round($_.Length/1KB,1)) }
+              Write-Host "  Key MSI/installer errors:" -ForegroundColor Gray
+              Select-String -Path "$dst\*" -Pattern 'Return value 3','Error [0-9]{4}','returned actual error','failed' -ErrorAction SilentlyContinue |
+                Select-Object -First 20 | ForEach-Object { Write-Host ("    " + $_.Filename + ": " + $_.Line.Trim()) }
+              Write-Host "  Application event log (errors/warnings):" -ForegroundColor Gray
+              Get-Content "$dst\events.txt" -TotalCount 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+            } catch { Write-Host "  diag failed: $_" -ForegroundColor Yellow }
           }
 
           $installed = $false
@@ -137,6 +169,14 @@ jobs:
             Add-MpPreference -ExclusionPath "D:\Program Files\Microvirt" -ErrorAction SilentlyContinue
             Write-Host "    Defender exclusions added." -ForegroundColor Gray
           } catch { Write-Host "    Defender config failed (may still work): $_" -ForegroundColor Gray }
+
+          # Verbose Windows Installer logging: shows WHY msiexec (run by the MEmu setup) fails
+          try {
+            $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer'
+            New-Item $pol -Force | Out-Null
+            Set-ItemProperty $pol -Name Logging -Value 'voicewarmup'
+          } catch { Write-Host "    MSI logging policy not set: $_" -ForegroundColor Gray }
+          $script:diagStart = Get-Date
 
           Write-Host "  Downloading 729 MB — progress bar below (1-40 min):" -ForegroundColor Gray
           Write-Host "  DO NOT cancel during download or install." -ForegroundColor Yellow
@@ -202,9 +242,14 @@ jobs:
               $installed=$true; $emulatorType="memu"
             } else {
               Write-Host "MEmu.exe not found after first attempt." -ForegroundColor Yellow
+              Save-InstallDiag "first"
               Write-Host ">>> RETRY: Running installer again (prereqs may now be installed)..." -ForegroundColor Yellow
               # Second run succeeds because VirtualBox prereqs are already installed from first run
               try {
+                # A/B TEST: first attempt ran with Defender real-time OFF and exited -7.
+                # Retry with it back ON, to learn whether disabling Defender is what breaks the installer.
+                try { Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue; Write-Host "    Defender real-time re-enabled for retry (A/B test)" -ForegroundColor Gray } catch {}
+                $script:diagStart = Get-Date
                 $proc2 = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
                 if ($proc2) {
                   $t2 = 0
@@ -233,7 +278,7 @@ jobs:
               if ($fr) {
                 Write-Host ">>> MEmu INSTALLED on retry: $($fr.FullName)" -ForegroundColor Green
                 $installed=$true; $emulatorType="memu"
-              } else { Write-Host "MEmu.exe still not found after retry." -ForegroundColor Yellow }
+              } else { Write-Host "MEmu.exe still not found after retry." -ForegroundColor Yellow; Save-InstallDiag "retry" }
             }
           } else { Write-Host "curl failed ($sz bytes) — moving on." -ForegroundColor Yellow }
 
@@ -305,7 +350,8 @@ jobs:
           #  Result
           # ════════════════════════════════════════════════════════
           if (-not $installed) {
-            Write-Host "##[error] No emulator could be installed."
+            Save-InstallDiag "final"
+            Write-Host "##[error] No emulator could be installed. Download the debug-* artifact (C:\debug\install-*) and send it."
             exit 1
           }
           $emulatorType | Set-Content "C:\emulator_type.txt" -Encoding ASCII

@@ -185,48 +185,48 @@ jobs:
           } catch { Write-Host "    MSI logging policy not set: $_" -ForegroundColor Gray }
           $script:diagStart = Get-Date
 
-          Write-Host "  Downloading 729 MB — progress bar below (1-40 min):" -ForegroundColor Gray
-          Write-Host "  DO NOT cancel during download or install." -ForegroundColor Yellow
-          $memuUrl = "https://dl.memuplay.com/download/Memu-Setup.exe"
-          for ($try = 1; $try -le 15; $try++) {
-            # FIX: curl exit 18 (connection cut mid-download) is NOT retried by --retry alone.
-            # --retry-all-errors + an outer loop + resume (-C -) keeps going from where it stopped.
-            & curl.exe -L -f --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused `
-              --connect-timeout 30 --speed-time 60 --speed-limit 1000 -C - --progress-bar `
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" `
-              -H "Referer: https://www.memuplay.com/" `
-              -H "Accept: application/octet-stream,*/*" `
-              -o $memuInst $memuUrl
-            $code = $LASTEXITCODE
-            $cur  = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
-            Write-Host ("  curl exit={0} size={1} MB (try {2}/15)" -f $code, [math]::Round($cur/1MB,1), $try)
-            if ($code -eq 0 -and $cur -gt 100MB) { break }
-            if ($code -eq 22 -and $cur -gt 700MB) { break }   # 416 = file already complete
-            if ($code -eq 33 -or $code -eq 36) { Remove-Item $memuInst -Force -ErrorAction SilentlyContinue }
-            Start-Sleep 10
-          }
-          $sz = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
-          if ($sz -gt 100MB) {
-            Write-Host ">>> Download OK: $([math]::Round($sz/1MB,1)) MB" -ForegroundColor Green
-            Write-Host ">>> INSTALLING MEmu now — 5-15 min of silence is NORMAL." -ForegroundColor Yellow
-            Write-Host "    Watch the dots. DO NOT cancel." -ForegroundColor Yellow
+          # ── Installer function: download (resumable) -> /S install -> wait for MEmu.exe ──────────
+          # Returns the MEmu.exe FileInfo, or $null.
+          function Install-MEmuFrom($label, $url) {
+            Write-Host ">>> [$label] $url" -ForegroundColor Cyan
+            Remove-Item $memuInst -Force -ErrorAction SilentlyContinue
+            $ok = $false
+            for ($try = 1; $try -le 15; $try++) {
+              $hdr = @()
+              if ($url -match 'memuplay') { $hdr = @("-H", "Referer: https://www.memuplay.com/") }
+              & curl.exe -L -f --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused `
+                --connect-timeout 30 --speed-time 60 --speed-limit 1000 -C - --progress-bar `
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36" `
+                @hdr -o $memuInst $url
+              $code = $LASTEXITCODE
+              $cur  = (Get-Item $memuInst -ErrorAction SilentlyContinue).Length
+              Write-Host ("  curl exit={0} size={1} MB (try {2}/15)" -f $code, [math]::Round($cur/1MB,1), $try)
+              if ($code -eq 0 -and $cur -gt 100MB) { $ok = $true; break }
+              if ($code -eq 22 -and $cur -gt 400MB) { $ok = $true; break }   # 416 = already complete
+              if ($code -eq 33 -or $code -eq 36) { Remove-Item $memuInst -Force -ErrorAction SilentlyContinue }
+              Start-Sleep 10
+            }
+            if (-not $ok) { Write-Host "  [$label] download failed - next candidate." -ForegroundColor Yellow; return $null }
+            # must be a real .exe ("MZ"), not a Google/HTML error page
+            $fs = [IO.File]::OpenRead($memuInst); $buf = New-Object byte[] 2; [void]$fs.Read($buf, 0, 2); $fs.Close()
+            if ($buf[0] -ne 0x4D -or $buf[1] -ne 0x5A) {
+              Write-Host "  [$label] downloaded file is not an .exe (quota/HTML page) - next candidate." -ForegroundColor Yellow
+              return $null
+            }
+            Write-Host ("  [$label] download OK: {0} MB. INSTALLING - 2-15 min of silence is normal." -f [math]::Round((Get-Item $memuInst).Length/1MB,1)) -ForegroundColor Green
+            $script:diagStart = Get-Date
+            $proc = $null
             try {
               $proc = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
-              if ($null -eq $proc) { throw "Start-Process returned null" }
               $t = 0
-              while (-not $proc.HasExited) {
+              while (-not $proc.HasExited -and $t -lt 900) {
                 Start-Sleep 15; $t += 15
                 Write-Host "    still installing... ${t}s" -ForegroundColor Gray
-                if ($t -gt 900) { Write-Host "Timeout — killing installer."; $proc.Kill(); break }
               }
-              Write-Host "    installer exit code: $($proc.ExitCode)" -ForegroundColor Gray
-            } catch {
-              Write-Host "    installer launch error: $_ — waiting 90s anyway" -ForegroundColor Yellow
-              Start-Sleep 90
-            }
-            Write-Host ("  installer exit code: {0}" -f $(try { $proc.ExitCode } catch { "n/a" }))
-            # FIX: the installer parent process can exit while setup keeps working in a child process,
-            # so poll for MEmu.exe (known folders first) instead of one search after 10 seconds.
+              if (-not $proc.HasExited) { Write-Host "    timeout - killing installer" -ForegroundColor Yellow; $proc.Kill() }
+              else { Write-Host "    installer exit code: $($proc.ExitCode)" -ForegroundColor Gray }
+            } catch { Write-Host "    installer launch error: $_" -ForegroundColor Yellow }
+            # parent installer may exit while a child keeps installing -> poll for MEmu.exe
             $f = $null; $idle = 0
             for ($w = 0; $w -lt 40 -and -not $f; $w++) {
               foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
@@ -240,57 +240,38 @@ jobs:
               $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'memu|microvirt|msiexec|setup' -and $_.Name -notmatch 'tailscale' })
               if ($busy.Count -eq 0) { $idle++ } else { $idle = 0 }
               Write-Host ("    waiting for MEmu files... {0}s (setup processes: {1})" -f ($w*15), (($busy | ForEach-Object { $_.Name }) -join ','))
-              if ($idle -ge 6) { break }   # nothing is installing any more
+              if ($idle -ge 4) { break }
               Start-Sleep 15
             }
             if (-not $f) { $f = Find-Exe "MEmu.exe" }
-            if ($f) {
-              Write-Host ">>> MEmu INSTALLED: $($f.FullName)" -ForegroundColor Green
-              $installed=$true; $emulatorType="memu"
-            } else {
-              Write-Host "MEmu.exe not found after first attempt." -ForegroundColor Yellow
-              Save-InstallDiag "first"
-              Write-Host ">>> RETRY with DEP exemption / compatibility layers..." -ForegroundColor Yellow
-              # Evidence (debug artifact): memu_setup.exe itself crashes, exception 0xC0000005, first fault in an
-              # 'unknown' module = code executing from non-executable memory (DEP). Windows Server defaults to DEP
-              # "OptOut" (applies to ALL programs), client Windows does not - so a packed installer can crash here.
-              $layerKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
-              $layerN = 0
-              foreach ($layer in @('DisableNXShowUI','WIN7RTM DisableNXShowUI','WIN8RTM DisableNXShowUI')) {
-                if ($installed) { break }
-                $layerN++
-                Write-Host "    >>> installer attempt with layer: $layer" -ForegroundColor Cyan
-                try {
-                  New-Item $layerKey -Force | Out-Null
-                  Set-ItemProperty $layerKey -Name $memuInst -Value $layer
-                  $env:__COMPAT_LAYER = $layer
-                  $script:diagStart = Get-Date
-                  $proc2 = Start-Process $memuInst -ArgumentList "/S" -PassThru -ErrorAction Stop
-                  $t2 = 0
-                  while (-not $proc2.HasExited -and $t2 -lt 900) {
-                    Start-Sleep 15; $t2 += 15
-                    Write-Host "    installing... ${t2}s" -ForegroundColor Gray
-                  }
-                  Write-Host "    exit code: $($proc2.ExitCode)" -ForegroundColor Gray
-                } catch { Write-Host "    launch error: $_" -ForegroundColor Yellow }
-                finally { Remove-Item Env:\__COMPAT_LAYER -ErrorAction SilentlyContinue }
-                $w2 = 0
-                while ((Get-Process msiexec -ErrorAction SilentlyContinue) -and $w2 -lt 300) {
-                  Start-Sleep 15; $w2 += 15
-                  Write-Host "    msiexec still running... ${w2}s" -ForegroundColor Gray
-                }
-                Start-Sleep 20
-                $fr = Find-Exe "MEmu.exe"
-                if ($fr) {
-                  Write-Host ">>> MEmu INSTALLED (layer: $layer): $($fr.FullName)" -ForegroundColor Green
-                  $installed=$true; $emulatorType="memu"
-                } else {
-                  Write-Host "    still not installed with layer: $layer" -ForegroundColor Yellow
-                  Save-InstallDiag ("layer$layerN")
-                }
-              }
+            if (-not $f) {
+              Write-Host "  [$label] MEmu.exe NOT found after install." -ForegroundColor Yellow
+              Save-InstallDiag ($label -replace '[^A-Za-z0-9]','_')
             }
-          } else { Write-Host "curl failed ($sz bytes) — moving on." -ForegroundColor Yellow }
+            return $f
+          }
+
+          # ── Candidates, in order ─────────────────────────────────────────────────────────────
+          # Debug evidence: the CURRENT dl.memuplay.com/Memu-Setup.exe (729 MB) crashes by itself
+          # (0xC0000005 / 0xC000001D illegal instruction inside memu_setup.exe) on this runner.
+          # So try the official archive builds (MEmu Release Archive page) first, newest first,
+          # and the 'latest' CDN file only as the last resort.
+          $gd = 'https://drive.usercontent.google.com/download?export=download&confirm=t&id='
+          $candidates = @(
+            @{ label = 'MEmu 9.5.7 archive'; url = $gd + '1WNTXcT7HdxaP3fBq4tW9XE0J3h13vhd3' },
+            @{ label = 'MEmu 9.5.6 archive'; url = $gd + '1TN6zC86m21TLfkyTSBeTTibsDOJbkzBu' },
+            @{ label = 'MEmu 9.5.3 archive'; url = $gd + '1UXdartUdB3AphuSszodn6QUYNK0TKD2s' },
+            @{ label = 'MEmu 9.3.3 archive'; url = $gd + '1BFQAJJc37Fb1DnJYqsTCO-HeZuwklvPf' },
+            @{ label = 'MEmu latest CDN';    url = 'https://dl.memuplay.com/download/Memu-Setup.exe' }
+          )
+          foreach ($c in $candidates) {
+            if ($installed) { break }
+            $f = Install-MEmuFrom $c.label $c.url
+            if ($f) {
+              Write-Host ">>> MEmu INSTALLED ($($c.label)): $($f.FullName)" -ForegroundColor Green
+              $installed = $true; $emulatorType = "memu"
+            }
+          }
 
           # ════════════════════════════════════════════════════════
           #  ATTEMPT 2 — MEmu via winget
